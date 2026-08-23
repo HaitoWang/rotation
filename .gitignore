@@ -1,0 +1,49 @@
+# Secrets and local overrides
+.env
+.env.*
+!.env.example
+secrets.json
+config.local.json
+
+# Runtime state and generated output
+state/
+outputs/
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.log
+account_*.json
+*.session
+*.token
+backend/data/
+backend/logs/
+source/data/.sms*
+source/webui/logs/
+source/webui/static/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# Node
+node_modules/
+.vite/
+dist/
+
+# IDE and OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.swp
+
+# Temporary files
+.tmp-*
+tmp/

@@ -1,0 +1,16 @@
+.git
+.gitignore
+source/webui/frontend/node_modules
+source/webui/frontend/.vite
+source/webui/static
+__pycache__
+**/__pycache__
+*.pyc
+*.pyo
+*.log
+source/webui/webui.db*
+source/data/.sms*
+.tmp-*
+state
+outputs
+.DS_Store
