@@ -6,7 +6,7 @@ export const startRegister = (payload) => http.post('/api/register', payload)
 // ──────────────── 运行记录 ────────────────
 export const listRuns = (limit = 50) => http.get('/api/runs', { params: { limit } })
 
-// ──────────────── 注册结果 registered ────────────────
+// ──────────────── 账号池 registered ────────────────
 export const listRegistered = (params) =>
   http.get('/api/registered', { params }) // { limit, offset, filter }
 
@@ -19,6 +19,13 @@ export const deleteRegistered = (email) =>
 // 手填凭证：不传的字段后端不动，传空串才是清空
 export const updateCredentials = (payload) =>
   http.post('/api/registered/update_credentials', payload)
+
+export const reauthorizeRegistered = (email, proxy = '') =>
+  http.post(
+    '/api/registered/reauthorize',
+    { email, proxy },
+    { timeout: 15 * 60 * 1000 },
+  )
 
 export const bulkDeleteRegistered = (payload) =>
   http.post('/api/registered/bulk_delete', payload) // { emails } 或 { all: true }

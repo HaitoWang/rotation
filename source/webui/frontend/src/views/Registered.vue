@@ -5,7 +5,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   listRegistered, getRegistered, deleteRegistered,
   bulkDeleteRegistered, checkPlus,
-  listExportFormats, exportRegistered, updateCredentials,
+  listExportFormats, exportRegistered, updateCredentials, reauthorizeRegistered,
 } from '@/api/register'
 import { copyText, fmtTime } from '@/api/request'
 import { useFormStore } from '@/stores/form'
@@ -24,6 +24,7 @@ const selected = ref([])
 const loading = ref(false)
 const checking = ref(false)
 const checkResult = ref('')
+const reauthorizing = ref('')
 
 const PLUS_TYPE = {
   plus_eligible: 'success', plus_active: 'primary', free: 'warning',
@@ -95,10 +96,33 @@ async function deleteSelected() {
   catch (e) { ElMessage.error(e.message) }
 }
 async function deleteAll() {
-  if (!(await confirm('这会清空注册结果表里的所有凭证！邮箱列表不受影响，确定？'))) return
+  if (!(await confirm('这会清空账号池里的所有凭证！邮箱列表不受影响，确定？'))) return
   if (!(await confirm('再次确认：真的要删除全部凭证吗？此操作不可恢复！'))) return
   try { const r = await bulkDeleteRegistered({ all: true }); ElMessage.success(`已清空 ${r.deleted} 条`); load() }
   catch (e) { ElMessage.error(e.message) }
+}
+
+async function reauthorize(row) {
+  try {
+    await ElMessageBox.confirm(
+      `重新授权 ${row.email}？\n\n流程可能需要邮箱验证码或 2FA，并会刷新 Access、Session 和 Codex Refresh Token。`,
+      '账号重授权',
+      { type: 'warning', confirmButtonText: '开始重授权', cancelButtonText: '取消' },
+    )
+  } catch { return }
+
+  reauthorizing.value = row.email
+  try {
+    const result = await reauthorizeRegistered(row.email, form.value.proxy.trim())
+    ElMessage.success(
+      `重授权成功：AT ${result.access_token_len} / ST ${result.session_token_len} / RT ${result.refresh_token_len}`,
+    )
+    await load()
+  } catch (e) {
+    ElMessage.error('重授权失败: ' + e.message)
+  } finally {
+    reauthorizing.value = ''
+  }
 }
 
 function handleDeleteCommand(command) {
@@ -289,8 +313,8 @@ onActivated(() => load())
       <template #header>
         <div class="panel-header">
           <div class="panel-title-group">
-            <h2 class="section-title">凭证列表</h2>
-            <p class="section-subtitle">共 {{ total }} 个已注册账号</p>
+            <h2 class="section-title">账号池</h2>
+            <p class="section-subtitle">共 {{ total }} 个账号，可检查、重授权和导出凭证</p>
           </div>
           <el-dropdown trigger="click" @command="doExport" @visible-change="(v) => v && loadExportFormats()">
             <el-button type="primary" :loading="exporting">
@@ -419,15 +443,27 @@ onActivated(() => load())
         <el-table-column label="时间" width="160">
           <template #default="{ row }">{{ fmtTime(row.created_at) }}</template>
         </el-table-column>
-        <el-table-column label="操作" width="200" fixed="right">
+        <el-table-column label="操作" width="280" fixed="right">
           <template #default="{ row }">
-            <el-button size="small" text @click="viewCred(row.email)">查看凭证</el-button>
-            <el-button size="small" text type="warning" @click="openEdit(row)">编辑</el-button>
-            <el-button size="small" text type="danger" @click="deleteOne(row.email)">删除</el-button>
+            <div class="row-actions">
+              <el-button size="small" text @click="viewCred(row.email)">查看凭证</el-button>
+              <el-button size="small" text type="warning" @click="openEdit(row)">编辑</el-button>
+              <el-button
+                size="small"
+                text
+                type="primary"
+                :loading="reauthorizing === row.email"
+                :disabled="Boolean(reauthorizing) && reauthorizing !== row.email"
+                @click="reauthorize(row)"
+              >
+                <el-icon><RefreshRight /></el-icon>重授权
+              </el-button>
+              <el-button size="small" text type="danger" @click="deleteOne(row.email)">删除</el-button>
+            </div>
           </template>
         </el-table-column>
         <template #empty>
-          <el-empty description="暂无注册结果，去「单次注册」或「全自动批量」跑号" :image-size="70" />
+          <el-empty description="账号池暂无账号，去「单次注册」或「全自动批量」跑号" :image-size="70" />
         </template>
       </el-table>
       <div style="display: flex; justify-content: center; margin-top: 14px">
@@ -529,6 +565,12 @@ onActivated(() => load())
 <style scoped>
 .selected-badge { padding: 5px 9px; color: var(--brand); border-radius: 7px; background: var(--brand-soft); font-size: 11px; font-weight: 600; }
 .check-result { display: flex; align-items: center; gap: 7px; margin: -3px 0 13px; padding: 8px 10px; color: var(--el-text-color-regular); border-radius: 8px; background: var(--el-fill-color-lighter); font-size: 11px; }
+.row-actions { display: flex; flex-wrap: nowrap; align-items: center; gap: 4px; white-space: nowrap; }
+:deep(.row-actions .el-button + .el-button) { margin-left: 0; }
+:deep(.el-table td.el-table-fixed-column--right) { background: var(--el-bg-color); }
+:deep(.el-table__body tr.el-table__row--striped > td.el-table-fixed-column--right) { background: var(--el-table-tr-bg-color); }
+:deep(.el-table__body tr:hover > td.el-table-fixed-column--right),
+:deep(.el-table__body tr.el-table__row--striped:hover > td.el-table-fixed-column--right) { background: var(--el-table-row-hover-bg-color); }
 /* 表格里「点一下就复制」的明文单元格（密码 / 2FA secret）。
    :deep 是必需的：.el-button 由 Element Plus 渲染，scoped 的属性选择器打不到它。
 

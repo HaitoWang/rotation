@@ -433,7 +433,7 @@ class TeamService:
             status, payload = self.client.request(method, path, credentials, **kwargs)
         return status, payload
 
-    def get_team_detail(self, mother: dict) -> dict:
+    def get_team_seats(self, mother: dict) -> dict:
         workspace_id = str(mother.get("workspace_id") or "")
         if not workspace_id:
             raise TeamApiError("母号缺少 workspace_id")
@@ -449,6 +449,28 @@ class TeamService:
         remaining = _remaining_default_seats(payload)
         if not details or remaining is None:
             raise TeamApiError("母号席位响应缺少可识别的数据")
+
+        capacity = []
+        raw_capacity = details.get("seat_capacity")
+        if isinstance(raw_capacity, list):
+            for item in raw_capacity:
+                if isinstance(item, dict):
+                    capacity.append({
+                        "type": str(item.get("type") or ""),
+                        "available": _seat_count(item.get("available")),
+                        "paid": _seat_count(item.get("paid")),
+                    })
+        return {
+            "entitled": _seat_count(details.get("seats_entitled")),
+            "in_use": _seat_count(details.get("seats_in_use")),
+            "remaining_default": remaining,
+            "capacity": capacity,
+        }
+
+    def get_team_members(self, mother: dict) -> dict:
+        workspace_id = str(mother.get("workspace_id") or "")
+        if not workspace_id:
+            raise TeamApiError("母号缺少 workspace_id")
 
         credentials = self._credentials_from_mother(mother)
         members: list[dict] = []
@@ -482,26 +504,17 @@ class TeamService:
             if not entries or len(entries) < 100 or (upstream_total is not None and len(members) >= upstream_total):
                 break
             offset += len(entries)
-
-        capacity = []
-        raw_capacity = details.get("seat_capacity")
-        if isinstance(raw_capacity, list):
-            for item in raw_capacity:
-                if isinstance(item, dict):
-                    capacity.append({
-                        "type": str(item.get("type") or ""),
-                        "available": _seat_count(item.get("available")),
-                        "paid": _seat_count(item.get("paid")),
-                    })
         return {
-            "seats": {
-                "entitled": _seat_count(details.get("seats_entitled")),
-                "in_use": _seat_count(details.get("seats_in_use")),
-                "remaining_default": remaining,
-                "capacity": capacity,
-            },
             "members": members,
             "total_members": max(total, len(members)),
+        }
+
+    def get_team_detail(self, mother: dict) -> dict:
+        seats = self.get_team_seats(mother)
+        member_detail = self.get_team_members(mother)
+        return {
+            "seats": seats,
+            **member_detail,
         }
 
     def invite_and_accept(self, mother: dict, account: dict) -> dict:
@@ -539,7 +552,7 @@ class TeamService:
 
         member_id = child.user_id
         for attempt in range(3):
-            detail = self.get_team_detail(mother)
+            detail = self.get_team_members(mother)
             match = next(
                 (item for item in detail["members"] if item.get("email") == child.email),
                 None,
@@ -563,9 +576,9 @@ class TeamService:
             account_id=workspace_id,
             retries=2,
         )
-        if status in {401, 403}:
+        if status == 401:
             return {
-                "status": "dead",
+                "status": "auth_required",
                 "http_status": status,
                 "primary_used_percent": None,
                 "secondary_used_percent": None,
@@ -638,6 +651,7 @@ class TeamRotationController:
         self._cycle_count = 0
         self._current_mother = ""
         self._last_error = ""
+        self._force_team_refresh = True
         self._options = self._load_options()
 
     @staticmethod
@@ -646,26 +660,21 @@ class TeamRotationController:
             interval = max(10, int(float(db.get_setting("team_rotation_interval_seconds", "300"))))
         except (TypeError, ValueError):
             interval = 300
-        try:
-            threshold = min(100.0, max(1.0, float(db.get_setting("team_rotation_threshold", "100"))))
-        except (TypeError, ValueError):
-            threshold = 100.0
         return {
             "interval_seconds": interval,
-            "quota_threshold": threshold,
+            "quota_threshold": 100.0,
             "proxy": db.get_setting("team_rotation_proxy", ""),
         }
 
     def _save_options(self, options: dict) -> dict:
         interval = max(10, int(options.get("interval_seconds") or 300))
-        threshold = min(100.0, max(1.0, float(options.get("quota_threshold") or 100)))
         proxy = str(options.get("proxy") or "").strip()
         db.set_setting("team_rotation_interval_seconds", interval)
-        db.set_setting("team_rotation_threshold", threshold)
+        db.set_setting("team_rotation_threshold", 100)
         db.set_setting("team_rotation_proxy", proxy)
         self._options = {
             "interval_seconds": interval,
-            "quota_threshold": threshold,
+            "quota_threshold": 100.0,
             "proxy": proxy,
         }
         return dict(self._options)
@@ -687,6 +696,7 @@ class TeamRotationController:
             self._started_at = time.time()
             self._next_cycle_at = self._started_at
             self._last_error = ""
+            self._force_team_refresh = True
             self._thread = threading.Thread(
                 target=self._loop, daemon=True, name="team-rotation"
             )
@@ -731,6 +741,7 @@ class TeamRotationController:
                 return {"ok": False, "error": "请先启动 Team 轮转"}
             if self._state == RotationState.PAUSED:
                 return {"ok": False, "error": "轮转已暂停，请先恢复"}
+            self._force_team_refresh = True
             self._next_cycle_at = time.time()
             self._wake_event.set()
         return {"ok": True, **self.snapshot()}
@@ -790,6 +801,11 @@ class TeamRotationController:
                 )
                 break
         self._event("INFO", "remove", f"管理员手动移出成员 {member_id}", mother_id)
+        with self._lock:
+            self._force_team_refresh = True
+            if self._state == RotationState.RUNNING:
+                self._next_cycle_at = time.time()
+                self._wake_event.set()
         return result
 
     def _mother_lock(self, mother_id: str) -> threading.Lock:
@@ -833,8 +849,15 @@ class TeamRotationController:
             self._last_cycle_at = time.time()
             self._cycle_count += 1
             self._last_error = ""
+            force_team_refresh = self._force_team_refresh
+            self._force_team_refresh = False
         mothers = db.list_team_mothers(include_secret=True, enabled_only=True)
-        self._event("INFO", "cycle", f"开始第 {self._cycle_count} 轮，启用母号 {len(mothers)} 个")
+        logger.debug(
+            "[cycle] 开始第 %s 轮，启用母号 %s 个，刷新 Team=%s",
+            self._cycle_count,
+            len(mothers),
+            force_team_refresh,
+        )
         for mother in mothers:
             if self._stop_event.is_set() or self._pause_event.is_set():
                 break
@@ -843,7 +866,10 @@ class TeamRotationController:
                 self._current_mother = mother.get("name") or mother_id
             try:
                 with self._mother_lock(mother_id):
-                    self._process_mother(mother)
+                    self._process_mother(
+                        mother,
+                        force_team_refresh=force_team_refresh,
+                    )
             except Exception as exc:
                 message = str(exc)[:1000]
                 db.record_team_mother_check(mother_id, error=message)
@@ -853,48 +879,94 @@ class TeamRotationController:
         with self._lock:
             self._current_mother = ""
 
-    def _process_mother(self, mother: dict) -> None:
+    def _process_mother(
+        self,
+        mother: dict,
+        *,
+        force_team_refresh: bool = True,
+    ) -> None:
         mother_id = mother["id"]
         service = self._service_factory(self._options.get("proxy", ""))
         try:
-            detail = service.get_team_detail(mother)
-            seats = detail["seats"]
-            db.record_team_mother_check(
-                mother_id,
-                entitled=seats.get("entitled"),
-                in_use=seats.get("in_use"),
-                remaining=seats.get("remaining_default"),
-            )
-            upstream_by_email = {
-                item["email"]: item for item in detail["members"] if item.get("email")
+            seats = {
+                "entitled": _seat_count(mother.get("seats_entitled")),
+                "in_use": _seat_count(mother.get("seats_in_use")),
+                "remaining_default": _seat_count(mother.get("seats_remaining")),
+                "capacity": [],
             }
-            assignments = db.list_team_rotation_members(mother_id=mother_id, limit=5000)
-            for assignment in assignments:
-                upstream = upstream_by_email.get(str(assignment.get("email") or "").lower())
-                if upstream and assignment.get("status") != "active":
-                    db.update_team_rotation_member(
-                        assignment["id"],
-                        status="active",
-                        member_id=upstream.get("id") or assignment.get("member_id"),
-                        joined_at=assignment.get("joined_at") or time.time(),
-                        error="",
-                    )
-                elif not upstream and assignment.get("status") == "active":
-                    db.update_team_rotation_member(
-                        assignment["id"], status="removed", removed_at=time.time(), error="成员已不在 Team"
-                    )
+            detail: Optional[dict] = None
 
-            removed_any = False
+            def refresh_team_detail() -> None:
+                nonlocal detail, seats
+                detail = service.get_team_detail(mother)
+                seats = detail["seats"]
+                db.record_team_mother_check(
+                    mother_id,
+                    entitled=seats.get("entitled"),
+                    in_use=seats.get("in_use"),
+                    remaining=seats.get("remaining_default"),
+                )
+                upstream_by_email = {
+                    item["email"]: item
+                    for item in detail["members"]
+                    if item.get("email")
+                }
+                assignments = db.list_team_rotation_members(
+                    mother_id=mother_id,
+                    limit=5000,
+                )
+                for assignment in assignments:
+                    upstream = upstream_by_email.get(
+                        str(assignment.get("email") or "").lower()
+                    )
+                    if upstream and assignment.get("status") != "active":
+                        db.update_team_rotation_member(
+                            assignment["id"],
+                            status="active",
+                            member_id=upstream.get("id") or assignment.get("member_id"),
+                            joined_at=assignment.get("joined_at") or time.time(),
+                            error="",
+                        )
+                    elif not upstream and assignment.get("status") == "active":
+                        db.update_team_rotation_member(
+                            assignment["id"],
+                            status="removed",
+                            removed_at=time.time(),
+                            error="成员已不在 Team",
+                        )
+
+            if force_team_refresh or any(
+                seats.get(key) is None
+                for key in ("entitled", "in_use", "remaining_default")
+            ):
+                refresh_team_detail()
+
+            removed_count = 0
             active_members = db.list_team_rotation_members(mother_id=mother_id, status="active", limit=5000)
             for assignment in active_members:
                 if self._stop_event.is_set() or self._pause_event.is_set():
                     break
                 account = db.get_registered(assignment["email"])
                 if not account:
-                    self._remove_assignment(service, mother, assignment, "本地凭证已删除", "removed")
-                    removed_any = True
+                    db.update_team_rotation_member(
+                        assignment["id"],
+                        last_checked_at=time.time(),
+                        error="本地凭证不存在，无法检查额度",
+                    )
                     continue
                 quota = service.check_quota(account, mother["workspace_id"])
+                if quota.get("status") == "auth_required":
+                    db.update_team_rotation_member(
+                        assignment["id"],
+                        last_checked_at=time.time(),
+                        error=quota.get("error") or "授权失效",
+                    )
+                    if not self._reauthorize_assignment(mother, assignment):
+                        continue
+                    account = db.get_registered(assignment["email"])
+                    if not account:
+                        continue
+                    quota = service.check_quota(account, mother["workspace_id"])
                 checked_at = time.time()
                 primary = quota.get("primary_used_percent")
                 secondary = quota.get("secondary_used_percent")
@@ -906,22 +978,39 @@ class TeamRotationController:
                     error=quota.get("error") or "",
                 )
                 values = [value for value in (primary, secondary) if value is not None]
-                exhausted = bool(values and max(values) >= self._options["quota_threshold"])
-                if quota.get("status") == "dead" or exhausted:
-                    reason = quota.get("error") or f"额度达到 {max(values):g}%"
+                exhausted = bool(values and max(values) >= 100.0)
+                if exhausted:
+                    reason = f"额度达到 {max(values):g}%"
                     self._remove_assignment(service, mother, assignment, reason, "exhausted")
-                    removed_any = True
+                    removed_count += 1
 
-            if removed_any:
-                detail = service.get_team_detail(mother)
-                seats = detail["seats"]
+            if removed_count:
+                seats["remaining_default"] = int(seats.get("remaining_default") or 0) + removed_count
+                if seats.get("in_use") is not None:
+                    seats["in_use"] = max(0, int(seats["in_use"]) - removed_count)
+                db.record_team_mother_check(
+                    mother_id,
+                    entitled=seats.get("entitled"),
+                    in_use=seats.get("in_use"),
+                    remaining=seats.get("remaining_default"),
+                )
+
+            candidate_available = db.has_team_rotation_candidate()
+            cached_remaining = int(seats.get("remaining_default") or 0)
+            if cached_remaining > 0 and candidate_available and detail is None:
+                refresh_team_detail()
 
             remaining = int(seats.get("remaining_default") or 0)
             consecutive_join_failures = 0
-            while remaining > 0 and not self._stop_event.is_set() and not self._pause_event.is_set():
+            joined_count = 0
+            while (
+                remaining > 0
+                and candidate_available
+                and not self._stop_event.is_set()
+                and not self._pause_event.is_set()
+            ):
                 claim = db.claim_team_rotation_candidate(mother_id)
                 if not claim:
-                    self._event("WARNING", "pool", "注册成功账号池已无可用 Access Token", mother_id)
                     break
                 account = db.get_registered(claim["email"])
                 if not account:
@@ -952,6 +1041,22 @@ class TeamRotationController:
                 )
                 self._event("INFO", "join", "子号已加入 Team", mother_id, claim["email"])
                 remaining -= 1
+                joined_count += 1
+                candidate_available = db.has_team_rotation_candidate()
+
+            if remaining > 0 and not candidate_available and (force_team_refresh or removed_count):
+                self._event("WARNING", "pool", "注册成功账号池已无可用 Access Token", mother_id)
+
+            if joined_count:
+                seats["remaining_default"] = remaining
+                if seats.get("in_use") is not None:
+                    seats["in_use"] = int(seats["in_use"]) + joined_count
+                db.record_team_mother_check(
+                    mother_id,
+                    entitled=seats.get("entitled"),
+                    in_use=seats.get("in_use"),
+                    remaining=remaining,
+                )
 
             # 加入 Team 成功后再推 Hub。历史 active 成员和上轮失败的成员也会在这里重试。
             for assignment in db.list_team_rotation_members(
@@ -961,16 +1066,13 @@ class TeamRotationController:
                     break
                 if assignment.get("hub_status") == "success":
                     continue
+                if assignment.get("hub_status") == "failed":
+                    retry_delay = max(60, int(self._options.get("interval_seconds") or 300))
+                    last_attempt = float(assignment.get("hub_last_attempt_at") or 0)
+                    if last_attempt and time.time() - last_attempt < retry_delay:
+                        continue
                 self._push_assignment_to_hub(mother, assignment)
 
-            final_detail = service.get_team_detail(mother)
-            final_seats = final_detail["seats"]
-            db.record_team_mother_check(
-                mother_id,
-                entitled=final_seats.get("entitled"),
-                in_use=final_seats.get("in_use"),
-                remaining=final_seats.get("remaining_default"),
-            )
         finally:
             service.close()
 
@@ -994,7 +1096,55 @@ class TeamRotationController:
         )
         self._event("INFO", "remove", reason, mother["id"], assignment["email"])
 
-    def _push_assignment_to_hub(self, mother: dict, assignment: dict) -> None:
+    def _reauthorize_assignment(
+        self,
+        mother: dict,
+        assignment: dict,
+        *,
+        repush_hub: bool = True,
+    ) -> bool:
+        email = str(assignment.get("email") or "").strip().lower()
+        self._event("WARNING", "auth", "额度检查返回 401，开始重新授权", mother["id"], email)
+        try:
+            from . import registrar
+
+            result = registrar.reauthorize_registered_account(
+                email,
+                proxy=self._options.get("proxy", ""),
+                stop_event=self._stop_event,
+            )
+        except Exception as exc:
+            result = {"ok": False, "error": str(exc)}
+        if not result.get("ok"):
+            error = f"重新授权失败: {result.get('error') or '未知错误'}"
+            db.update_team_rotation_member(assignment["id"], error=error[:1000])
+            self._event("ERROR", "auth", error, mother["id"], email)
+            return False
+
+        db.update_team_rotation_member(
+            assignment["id"],
+            error="",
+            hub_status="pending",
+            hub_error="",
+        )
+        self._event("INFO", "auth", "重新授权成功，重新推送 Hub", mother["id"], email)
+        if repush_hub:
+            self._push_assignment_to_hub(
+                mother,
+                assignment,
+                allow_reauthorize=False,
+                reauthorized=True,
+            )
+        return True
+
+    def _push_assignment_to_hub(
+        self,
+        mother: dict,
+        assignment: dict,
+        *,
+        allow_reauthorize: bool = True,
+        reauthorized: bool = False,
+    ) -> None:
         try:
             export_cfg = db.get_export_internal_config().get("sub2api", {})
         except Exception as exc:
@@ -1016,6 +1166,11 @@ class TeamRotationController:
             )
             return
 
+        db.update_team_rotation_member(
+            assignment["id"],
+            hub_last_attempt_at=time.time(),
+        )
+
         try:
             from . import exporter
 
@@ -1032,6 +1187,11 @@ class TeamRotationController:
             result = exporter.run_exports(
                 {
                     **account,
+                    "name": (
+                        f"重授权-{assignment['email']}"
+                        if reauthorized
+                        else assignment["email"]
+                    ),
                     "account_id": mother["workspace_id"],
                     "plan_type": "team",
                     "notes": "Team 轮转",
@@ -1039,6 +1199,11 @@ class TeamRotationController:
                 cpa_cfg=None,
                 sub2api_cfg=export_cfg,
                 log_fn=export_log,
+                token_update_fn=lambda tokens: db.update_registered_codex_tokens(
+                    assignment["email"],
+                    refresh_token=tokens.get("refresh_token") or "",
+                    id_token=tokens.get("id_token") or "",
+                ),
             ).get("sub2api") or {}
         except Exception as exc:
             result = {"ok": False, "error": str(exc)}
@@ -1055,6 +1220,31 @@ class TeamRotationController:
             )
         else:
             error = str(result.get("error") or "Hub 推送失败")[:1000]
+            auth_invalid = any(marker in error.lower() for marker in (
+                "refresh_token_invalidated",
+                "session has ended",
+                "refresh_token 失效",
+            ))
+            if allow_reauthorize and auth_invalid:
+                self._event(
+                    "WARNING",
+                    "auth",
+                    "Hub Codex Refresh Token 已失效，开始重新授权",
+                    mother["id"],
+                    assignment["email"],
+                )
+                if self._reauthorize_assignment(
+                    mother,
+                    assignment,
+                    repush_hub=False,
+                ):
+                    self._push_assignment_to_hub(
+                        mother,
+                        assignment,
+                        allow_reauthorize=False,
+                        reauthorized=True,
+                    )
+                    return
             db.update_team_rotation_member(
                 assignment["id"], hub_status="failed", hub_error=error
             )

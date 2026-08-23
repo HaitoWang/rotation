@@ -11,6 +11,7 @@ const defaults = {
   autoConcurrency: 1,
   autoCoolDown: 3,
   autoTargetCount: 0,
+  autoPushToHub: false,
   // 注册后自动绑 2FA。单次 / 批量都**默认 true**：每个号都要 2FA。
   // 仍然拆成两个字段（而不是共用一个）：单次页是验 bug / 试流程的测试台，
   // 共用的话在那边临时关掉，回头批量跑几百个号就全裸奔了。

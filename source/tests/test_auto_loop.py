@@ -15,10 +15,24 @@ from webui.auto_loop import (
     _proxy_session_key,
 )
 from webui import registrar
+from webui import exporter
 from sms_provider import _rotate_country_ids
 
 
 class AutoLoopProxyTests(unittest.TestCase):
+    def test_registration_hub_push_has_independent_switch(self):
+        config = {
+            "cpa": {"enabled": False},
+            "sub2api": {"enabled": True},
+            "team_sso": {"enabled": False},
+        }
+        with mock.patch.object(registrar.db, "get_export_internal_config", return_value=config), \
+                mock.patch.object(exporter, "run_exports") as run_exports:
+            registrar._try_export_to_panels("run-disabled", {"email": "a@example.com"}, push_to_hub=False)
+            run_exports.assert_not_called()
+            registrar._try_export_to_panels("run-enabled", {"email": "a@example.com"}, push_to_hub=True)
+            run_exports.assert_called_once()
+
     def test_proxy_pool_deduplicates_session_ids(self):
         first = "socks5://user-session-abc-sessTime-5:pw@proxy.test:10000"
         duplicate = "socks5://other-session-abc-sessTime-10:pw@proxy.test:10000"

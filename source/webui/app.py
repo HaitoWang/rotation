@@ -965,6 +965,38 @@ def api_update_credentials(req: UpdateCredReq):
     return {"ok": True, "email": email, "changed": changed}
 
 
+class ReauthorizeRegisteredReq(BaseModel):
+    email: str = Field(..., description="要重新授权的账号邮箱")
+    proxy: str = Field("", description="重新授权使用的代理，留空直连")
+
+
+@app.post("/api/registered/reauthorize")
+def api_reauthorize_registered(req: ReauthorizeRegisteredReq):
+    """重新登录已有账号并刷新 Web 与 Codex OAuth 凭证。"""
+    email = (req.email or "").strip().lower()
+    if not email:
+        raise HTTPException(400, "email 不能为空")
+    if not db.get_registered(email):
+        raise HTTPException(404, f"账号池中未找到账号: {email}")
+
+    result = registrar.reauthorize_registered_account(
+        email,
+        proxy=(req.proxy or "").strip(),
+    )
+    if not result.get("ok"):
+        raise HTTPException(400, result.get("error") or "重授权失败")
+
+    account = result.get("account") or db.get_registered(email) or {}
+    logger.info("[registered] 重授权成功 email=%s", email)
+    return {
+        "ok": True,
+        "email": email,
+        "access_token_len": len(account.get("access_token") or ""),
+        "session_token_len": len(account.get("session_token") or ""),
+        "refresh_token_len": len(account.get("refresh_token") or ""),
+    }
+
+
 # ──────────────────────── Plus 试用检查 ────────────────────────
 
 
@@ -1109,6 +1141,7 @@ class AutoLoopStartReq(BaseModel):
     allow_existing_login: bool = True
     cool_down_seconds: float = 3.0  # 每个 worker 跑完后冷却（防风控）
     target_count: int = 0        # 目标成功数（0=不限量，达标自动停止）
+    push_to_hub: bool = False    # 本轮自动注册成功后是否推送 SUB2API Hub
     # 批量页已放开关且**默认开**（主人要求每个号都绑）。
     # 这里的 default 仍保持 False —— 它只在「前端没传这个字段」时生效，
     # 是给旧前端缓存 / 直接打 API 的保守兜底：漏传时宁可不绑，也不要

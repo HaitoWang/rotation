@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from webui import db, exporter
+from webui import db, exporter, registrar
 from webui.team_rotation import TeamRotationController
 
 
@@ -35,6 +35,7 @@ class Sub2ApiHubPayloadTests(unittest.TestCase):
         account = exporter.build_sub2api_payload(
             {
                 "email": "user@example.com",
+                "name": "重授权-user@example.com",
                 "access_token": self.access_token,
                 "refresh_token": "refresh-token",
                 "id_token": "id-token",
@@ -60,6 +61,7 @@ class Sub2ApiHubPayloadTests(unittest.TestCase):
             "codex-main": "gpt-5.6-sol",
         })
         self.assertEqual(credentials["email"], "user@example.com")
+        self.assertEqual(account["name"], "重授权-user@example.com")
         self.assertTrue(credentials["expires_at"].endswith("Z"))
         self.assertEqual(account["group_ids"], [12])
         self.assertEqual(account["concurrency"], 3)
@@ -111,6 +113,64 @@ class Sub2ApiHubPayloadTests(unittest.TestCase):
                 "codex-main": "gpt-5.4",
             },
         )
+
+    def test_reauthorized_token_uses_a_new_idempotency_key(self):
+        response = mock.Mock(status_code=201)
+        response.json.return_value = {"accounts": [{"id": "hub-account-1"}]}
+        response.text = ""
+        cffi = mock.Mock()
+        cffi.post.return_value = response
+        cfg = {
+            "sub2api_url": "https://hub.example.com",
+            "sub2api_api_key": "admin-key",
+            "sub2api_group_ids": "12",
+        }
+        cred = {
+            "email": "user@example.com",
+            "access_token": self.access_token,
+            "account_id": "team-workspace",
+        }
+
+        with mock.patch.object(exporter, "_import_cffi", return_value=cffi):
+            before = exporter.export_to_sub2api(cred, cfg)
+            after = exporter.export_to_sub2api(
+                {**cred, "access_token": self.access_token + "-reauthorized"},
+                cfg,
+            )
+
+        self.assertNotEqual(before["idempotency_key"], after["idempotency_key"])
+
+    def test_run_exports_persists_rotated_refresh_token_before_upload(self):
+        token_update = mock.Mock()
+        cfg = {"enabled": True}
+        with mock.patch.object(
+            exporter,
+            "refresh_codex_token",
+            return_value={
+                "access_token": self.access_token,
+                "refresh_token": "rotated-refresh-token",
+                "id_token": "rotated-id-token",
+            },
+        ), mock.patch.object(
+            exporter,
+            "export_to_sub2api",
+            return_value={"ok": True},
+        ):
+            result = exporter.run_exports(
+                {
+                    "email": "user@example.com",
+                    "refresh_token": "old-refresh-token",
+                },
+                sub2api_cfg=cfg,
+                token_update_fn=token_update,
+            )
+
+        self.assertTrue(result["sub2api"]["ok"])
+        token_update.assert_called_once_with({
+            "email": "user@example.com",
+            "refresh_token": "rotated-refresh-token",
+            "id_token": "rotated-id-token",
+        })
 
     def test_default_supported_models_match_hub_configuration(self):
         self.assertEqual(exporter.parse_sub2api_models(None), [
@@ -233,6 +293,199 @@ class TeamRotationHubStateTests(unittest.TestCase):
         self.assertEqual(updated["hub_status"], "success")
         self.assertIsNotNone(updated["hub_pushed_at"])
         self.assertEqual(updated["hub_error"], "")
+
+    def test_reauthorized_hub_push_prefixes_display_name_only(self):
+        controller = TeamRotationController(service_factory=mock.Mock())
+        assignment = db.find_team_rotation_member(
+            self.mother["id"], "child@example.com"
+        )
+        with mock.patch.object(
+            exporter,
+            "run_exports",
+            return_value={"sub2api": {"ok": True, "account_id": "hub-reauth"}},
+        ) as run_exports:
+            controller._push_assignment_to_hub(
+                self.mother, assignment, reauthorized=True
+            )
+
+        pushed_cred = run_exports.call_args.args[0]
+        self.assertEqual(pushed_cred["name"], "重授权-child@example.com")
+        self.assertEqual(pushed_cred["email"], "child@example.com")
+
+    def _quota_service(self, *quota_results):
+        service = mock.Mock()
+        service.get_team_detail.return_value = {
+            "seats": {"entitled": 2, "in_use": 2, "remaining_default": 0},
+            "members": [{"id": "member-1", "email": "child@example.com"}],
+        }
+        service.check_quota.side_effect = list(quota_results)
+        service.remove_member.return_value = {"removed": True}
+        return service
+
+    def test_quota_401_reauthorizes_repushes_and_does_not_remove(self):
+        service = self._quota_service(
+            {
+                "status": "auth_required",
+                "http_status": 401,
+                "primary_used_percent": None,
+                "secondary_used_percent": None,
+                "error": "授权失效 (HTTP 401)",
+            },
+            {
+                "status": "alive",
+                "http_status": 200,
+                "primary_used_percent": 45.0,
+                "secondary_used_percent": 20.0,
+                "error": "",
+            },
+        )
+        controller = TeamRotationController(service_factory=mock.Mock(return_value=service))
+
+        def mark_hub_success(_mother, assignment, **_kwargs):
+            db.update_team_rotation_member(assignment["id"], hub_status="success", hub_error="")
+
+        with mock.patch(
+            "webui.registrar.reauthorize_registered_account",
+            return_value={"ok": True, "account": db.get_registered("child@example.com")},
+        ) as reauthorize, mock.patch.object(
+            controller, "_push_assignment_to_hub", side_effect=mark_hub_success
+        ) as push:
+            controller._process_mother(self.mother)
+
+        reauthorize.assert_called_once()
+        push.assert_called_once()
+        service.remove_member.assert_not_called()
+        self.assertEqual(service.check_quota.call_count, 2)
+        updated = db.find_team_rotation_member(self.mother["id"], "child@example.com")
+        self.assertEqual(updated["status"], "active")
+        self.assertEqual(updated["primary_used_percent"], 45.0)
+        self.assertEqual(updated["hub_status"], "success")
+
+    def test_invalid_hub_refresh_token_reauthorizes_and_retries_once(self):
+        controller = TeamRotationController(service_factory=mock.Mock())
+        assignment = db.find_team_rotation_member(
+            self.mother["id"], "child@example.com"
+        )
+        invalid = {
+            "sub2api": {
+                "ok": False,
+                "error": "HTTP 401 refresh_token_invalidated: Your session has ended",
+            },
+        }
+        success = {"sub2api": {"ok": True, "account_id": "hub-2"}}
+
+        with mock.patch.object(
+            exporter,
+            "run_exports",
+            side_effect=[invalid, success],
+        ) as run_exports, mock.patch.object(
+            registrar,
+            "reauthorize_registered_account",
+            return_value={"ok": True, "account": db.get_registered("child@example.com")},
+        ) as reauthorize:
+            controller._push_assignment_to_hub(self.mother, assignment)
+
+        self.assertEqual(run_exports.call_count, 2)
+        reauthorize.assert_called_once()
+        updated = db.find_team_rotation_member(
+            self.mother["id"], "child@example.com"
+        )
+        self.assertEqual(updated["hub_status"], "success")
+
+    def test_reauthorization_requests_new_codex_refresh_token(self):
+        observed = {}
+
+        def start_registration(_account, options, observer=None):
+            observed.update(options)
+            db.save_registered({
+                **db.get_registered("child@example.com"),
+                "access_token": "new-web-access-token",
+                "session_token": "new-session-token",
+                "refresh_token": "new-codex-refresh-token",
+            })
+            observer("reauth-run", "done", {})
+            return "reauth-run"
+
+        with mock.patch.object(db, "get_account", return_value={
+            "email": "child@example.com",
+            "password": "mail-password",
+            "kind": "outlook",
+        }), mock.patch.object(
+            registrar,
+            "start_registration",
+            side_effect=start_registration,
+        ), mock.patch.object(
+            registrar,
+            "wait_run_done",
+            return_value=True,
+        ), mock.patch.object(
+            registrar,
+            "remove_run_observer",
+        ), mock.patch.object(
+            registrar,
+            "remove_run_queue",
+        ):
+            result = registrar.reauthorize_registered_account("child@example.com")
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(observed["want_refresh_token"])
+
+    def test_member_is_removed_only_when_quota_reaches_100_percent(self):
+        service = self._quota_service({
+            "status": "alive",
+            "http_status": 200,
+            "primary_used_percent": 100.0,
+            "secondary_used_percent": 40.0,
+            "error": "",
+        })
+        controller = TeamRotationController(service_factory=mock.Mock(return_value=service))
+        controller._process_mother(self.mother)
+
+        service.remove_member.assert_called_once_with(self.mother, "member-1")
+        updated = db.find_team_rotation_member(self.mother["id"], "child@example.com")
+        self.assertEqual(updated["status"], "exhausted")
+
+    def test_member_is_not_removed_below_100_percent(self):
+        service = self._quota_service({
+            "status": "alive",
+            "http_status": 200,
+            "primary_used_percent": 99.9,
+            "secondary_used_percent": 99.0,
+            "error": "",
+        })
+        db.update_team_rotation_member(self.assignment["id"], hub_status="success")
+        controller = TeamRotationController(service_factory=mock.Mock(return_value=service))
+        controller._process_mother(self.mother)
+
+        service.remove_member.assert_not_called()
+        updated = db.find_team_rotation_member(self.mother["id"], "child@example.com")
+        self.assertEqual(updated["status"], "active")
+        self.assertEqual(updated["primary_used_percent"], 99.9)
+
+    def test_periodic_quota_check_with_no_seat_skips_team_detail_api(self):
+        db.record_team_mother_check(
+            self.mother["id"],
+            entitled=2,
+            in_use=2,
+            remaining=0,
+        )
+        db.update_team_rotation_member(self.assignment["id"], hub_status="success")
+        mother = db.get_team_mother(self.mother["id"], include_secret=True)
+        service = mock.Mock()
+        service.check_quota.return_value = {
+            "status": "alive",
+            "http_status": 200,
+            "primary_used_percent": 42.0,
+            "secondary_used_percent": 10.0,
+            "error": "",
+        }
+        controller = TeamRotationController(service_factory=mock.Mock(return_value=service))
+
+        controller._process_mother(mother, force_team_refresh=False)
+
+        service.get_team_detail.assert_not_called()
+        service.invite_and_accept.assert_not_called()
+        service.check_quota.assert_called_once()
 
 
 if __name__ == "__main__":

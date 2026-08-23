@@ -52,6 +52,7 @@ async function start() {
       want_refresh_token: true,
       cool_down_seconds: parseFloat(form.value.autoCoolDown) || 0,
       target_count: parseInt(form.value.autoTargetCount, 10) || 0,
+      push_to_hub: form.value.autoPushToHub,
       // 批量默认绑 2FA（后端默认是 false，这个字段以前压根没传，
       // 所以批量跑出来的号一个都没 2FA）。留开关是因为绑定不可逆。
       want_2fa: form.value.autoWant2fa,
@@ -100,6 +101,14 @@ async function call(fn, name) {
             <span>仅对有密码的账号生效，secret 需要及时导出备份</span>
           </div>
           <el-switch v-model="form.autoWant2fa" />
+        </div>
+
+        <div class="setting-row">
+          <div class="setting-copy">
+            <strong>成功后推送 Hub</strong>
+            <span>仅控制本轮自动注册，不影响 Team 轮转加入后的 Hub 推送</span>
+          </div>
+          <el-switch v-model="form.autoPushToHub" />
         </div>
 
         <div class="proxy-row">
@@ -172,6 +181,7 @@ async function call(fn, name) {
 .field-note { margin-top: 5px; color: var(--el-text-color-secondary); font-size: 10px; }
 .setting-row, .proxy-row { display: flex; align-items: center; gap: 12px; padding: 12px 13px; border: 1px solid var(--app-border); border-radius: 9px; }
 .setting-row { justify-content: space-between; background: var(--el-fill-color-lighter); }
+.setting-row + .setting-row { margin-top: 10px; }
 .setting-copy, .proxy-copy { min-width: 0; display: flex; flex: 1; flex-direction: column; }
 .setting-copy strong, .proxy-copy strong { color: var(--app-title); font-size: 12px; font-weight: 600; }
 .setting-copy span, .proxy-copy span { margin-top: 4px; color: var(--el-text-color-secondary); font-size: 10px; line-height: 1.45; }

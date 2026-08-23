@@ -737,14 +737,19 @@ def _do_register(
         # 不能套用双完整会话竞速，否则会重复租号或消费同一 OTP。
         gmail_mail_source = mail_source in {"gmail", "gmail_link"}
         shared_mailbox_source = gmail_mail_source or mail_source == "mailbox_url"
-        mailbox_post_login_race = sms_mode == "session_race" and shared_mailbox_source
-        if sms_mode == "session_race" and is_pooled and not shared_mailbox_source:
+        session_race_enabled = not options.get("disable_session_race")
+        mailbox_post_login_race = (
+            session_race_enabled
+            and sms_mode == "session_race"
+            and shared_mailbox_source
+        )
+        if session_race_enabled and sms_mode == "session_race" and is_pooled and not shared_mailbox_source:
             _emit_status(run_id, "phase", {"phase": "session_race", "message": "启动 HeroSMS / SmsBower 双独立会话"})
             logging.getLogger("registrar").info(
                 "[session-race] 每个账号启动 HeroSMS、SmsBower 两个独立注册会话"
             )
             prebuilt = _run_session_race_auth(run_id, account, options, mail_source)
-        elif sms_mode == "session_race" and (not is_pooled or shared_mailbox_source):
+        elif session_race_enabled and sms_mode == "session_race" and (not is_pooled or shared_mailbox_source):
             logging.getLogger("registrar").warning(
                 "[session-race] 共享邮箱接码链路只登录一次；随后派生 HeroSMS / SmsBower Codex 分支"
             )
@@ -1010,7 +1015,12 @@ def _do_register(
             db.mark_done(email)
 
         # ─ 可选：导出到 CPA / SUB2API 面板（仅勾选启用时才执行） ─
-        _try_export_to_panels(run_id, d)
+        if not options.get("skip_exports"):
+            _try_export_to_panels(
+                run_id,
+                d,
+                push_to_hub=bool(options.get("push_to_hub", True)),
+            )
 
         result_summary = {
             "email": d.get("email"),
@@ -1112,7 +1122,7 @@ def _do_register(
         _current_run.run_id = None
 
 
-def _try_export_to_panels(run_id: str, cred: dict) -> None:
+def _try_export_to_panels(run_id: str, cred: dict, *, push_to_hub: bool = True) -> None:
     """注册完成后可选地把凭证导出到 team-sso / CPA / SUB2API。
 
     - 任一目标的"启用"开关关闭时,该目标跳过(不发请求);两者都未启用时整段 no-op。
@@ -1125,7 +1135,7 @@ def _try_export_to_panels(run_id: str, cred: dict) -> None:
         return
 
     cpa_enabled = bool(cfg.get("cpa", {}).get("enabled"))
-    sub2api_enabled = bool(cfg.get("sub2api", {}).get("enabled"))
+    sub2api_enabled = bool(cfg.get("sub2api", {}).get("enabled")) and push_to_hub
     team_sso_enabled = bool(cfg.get("team_sso", {}).get("enabled"))
 
     # team-sso consumes a versioned JSON credential payload. Persist it first so
@@ -1169,6 +1179,11 @@ def _try_export_to_panels(run_id: str, cred: dict) -> None:
             cpa_cfg=cfg.get("cpa") if cpa_enabled else None,
             sub2api_cfg=cfg.get("sub2api") if sub2api_enabled else None,
             log_fn=_log,
+            token_update_fn=lambda tokens: db.update_registered_codex_tokens(
+                cred.get("email") or "",
+                refresh_token=tokens.get("refresh_token") or "",
+                id_token=tokens.get("id_token") or "",
+            ),
         )
     except Exception as e:
         _log(f"导出整体异常: {e}", "error")
@@ -1336,6 +1351,76 @@ def wait_run_done(
             with _lock:
                 _run_done_events.pop(run_id, None)
             return True
+
+
+def reauthorize_registered_account(
+    email: str,
+    *,
+    proxy: str = "",
+    stop_event: Optional[threading.Event] = None,
+    timeout: float = 900,
+) -> dict:
+    """复用已有账号登录链，刷新 ChatGPT Session/Access Token。"""
+    normalized = str(email or "").strip().lower()
+    if not normalized:
+        return {"ok": False, "error": "缺少账号邮箱"}
+
+    account = db.get_account(normalized)
+    if not account:
+        rows = db.list_registered_by_emails([normalized])
+        registered = rows[0] if rows else {}
+        account = {
+            "email": normalized,
+            "password": registered.get("mail_password") or "",
+            "client_id": registered.get("mail_client_id") or "",
+            "refresh_token": registered.get("mail_refresh_token") or "",
+            "relay_url": registered.get("mail_url") or "",
+            "kind": registered.get("mail_provider") or db.get_setting("mail_source", "outlook"),
+        }
+    if not account.get("email"):
+        return {"ok": False, "error": "找不到账号对应的邮箱授权资料"}
+
+    outcome = {"ok": False, "error": "授权任务未返回结果"}
+
+    def observe(_run_id: str, kind: str, payload: dict) -> None:
+        if kind == "done":
+            outcome.update({"ok": True, "error": ""})
+        elif kind == "error":
+            outcome.update({"ok": False, "error": str(payload.get("message") or "授权失败")})
+
+    options = {
+        "want_access_token": True,
+        "want_session_token": True,
+        "want_refresh_token": True,
+        "want_2fa": False,
+        "allow_existing_login": True,
+        "otp_timeout": 180,
+        "proxy": str(proxy or "").strip(),
+        "stop_event": stop_event,
+        "disable_session_race": True,
+        "skip_exports": True,
+        "push_to_hub": False,
+    }
+    run_id = ""
+    try:
+        run_id = start_registration(account, options, observer=observe)
+        finished = wait_run_done(run_id, stop_event=stop_event, timeout=timeout)
+        if not finished:
+            return {"ok": False, "error": "重新授权等待超时", "run_id": run_id}
+        if not outcome["ok"]:
+            return {**outcome, "run_id": run_id}
+        refreshed = db.get_registered(normalized) or {}
+        if not str(refreshed.get("access_token") or "").strip():
+            return {"ok": False, "error": "重新授权完成但未保存 Access Token", "run_id": run_id}
+        if not str(refreshed.get("refresh_token") or "").strip():
+            return {"ok": False, "error": "重新授权完成但未保存 Codex Refresh Token", "run_id": run_id}
+        return {"ok": True, "account": refreshed, "run_id": run_id}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "run_id": run_id}
+    finally:
+        if run_id:
+            remove_run_observer(run_id)
+            remove_run_queue(run_id)
 
 
 def remove_run_queue(run_id: str) -> None:

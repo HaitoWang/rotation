@@ -22,7 +22,7 @@ const actions = [
   { title: '邮箱列表', detail: '添加并管理接码邮箱账号', icon: 'Files', path: '/pool' },
   { title: '单次注册', detail: '指定一个账号立即执行', icon: 'VideoPlay', path: '/register' },
   { title: '全自动批量', detail: '配置并启动持续任务', icon: 'MagicStick', path: '/auto' },
-  { title: '查看注册结果', detail: '检查凭证并批量导出', icon: 'CircleCheck', path: '/registered' },
+  { title: '账号池', detail: '检查、重授权并批量导出凭证', icon: 'CircleCheck', path: '/registered' },
 ]
 
 const autoStateLabel = computed(() => ({

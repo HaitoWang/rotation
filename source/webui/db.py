@@ -217,6 +217,7 @@ def init_db():
             error                    TEXT,
             hub_status               TEXT NOT NULL DEFAULT 'pending',
             hub_pushed_at            REAL,
+            hub_last_attempt_at       REAL,
             hub_error                TEXT,
             created_at               REAL NOT NULL,
             updated_at               REAL NOT NULL
@@ -294,6 +295,8 @@ def init_db():
         )
     if "hub_pushed_at" not in rotation_cols:
         con.execute("ALTER TABLE team_rotation_members ADD COLUMN hub_pushed_at REAL")
+    if "hub_last_attempt_at" not in rotation_cols:
+        con.execute("ALTER TABLE team_rotation_members ADD COLUMN hub_last_attempt_at REAL")
     if "hub_error" not in rotation_cols:
         con.execute("ALTER TABLE team_rotation_members ADD COLUMN hub_error TEXT")
     con.commit()
@@ -968,6 +971,39 @@ def update_registered_manual(email: str, password: Optional[str] = None,
         return True
 
 
+def update_registered_codex_tokens(
+    email: str,
+    *,
+    refresh_token: str = "",
+    id_token: str = "",
+) -> bool:
+    """Persist rotated Codex OAuth tokens without touching ChatGPT web tokens."""
+    email = (email or "").strip().lower()
+    refresh_token = (refresh_token or "").strip()
+    id_token = (id_token or "").strip()
+    if not email or not (refresh_token or id_token):
+        return False
+
+    sets: list[str] = []
+    values: list[str] = []
+    if refresh_token:
+        sets.append("refresh_token=?")
+        values.append(refresh_token)
+    if id_token:
+        sets.append("id_token=?")
+        values.append(id_token)
+    values.append(email)
+
+    with _lock:
+        con = _conn()
+        cur = con.execute(
+            f"UPDATE registered SET {', '.join(sets)} WHERE email=?",
+            values,
+        )
+        con.commit()
+        return cur.rowcount > 0
+
+
 def update_plus_check(email: str, plus_info: dict) -> None:
     """把 Plus 检查结果写入 extra_json.plus_check。"""
     email = email.lower()
@@ -1338,11 +1374,28 @@ def claim_team_rotation_candidate(mother_id: str) -> Optional[dict]:
             con.close()
 
 
+def has_team_rotation_candidate() -> bool:
+    """Return whether a successful account has never entered Team rotation."""
+    con = _conn()
+    try:
+        row = con.execute(
+            "SELECT 1 FROM registered AS r "
+            "WHERE coalesce(r.deleted_at, 0)=0 AND length(r.access_token)>0 "
+            "AND NOT EXISTS ("
+            "  SELECT 1 FROM team_rotation_members AS tm "
+            "  WHERE lower(tm.email)=lower(r.email)"
+            ") LIMIT 1"
+        ).fetchone()
+        return row is not None
+    finally:
+        con.close()
+
+
 def update_team_rotation_member(member_row_id: int, **fields) -> None:
     allowed = {
         "member_id", "status", "primary_used_percent", "secondary_used_percent",
         "joined_at", "last_checked_at", "removed_at", "error",
-        "hub_status", "hub_pushed_at", "hub_error",
+        "hub_status", "hub_pushed_at", "hub_last_attempt_at", "hub_error",
     }
     sets = []
     values = []

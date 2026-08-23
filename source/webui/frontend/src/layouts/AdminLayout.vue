@@ -24,7 +24,7 @@ const PAGE_DESCRIPTIONS = {
   '/auto': '配置并管理持续运行的批量任务',
   '/proxy': '维护注册流程使用的代理资源',
   '/pool': '查看和管理待注册邮箱账号',
-  '/registered': '检查、导出并维护已注册凭证',
+  '/registered': '检查、重授权、导出并维护账号凭证',
   '/team': '管理 Team 席位、成员额度与自动补位',
   '/runs': '回顾任务执行历史与结果',
   '/settings/mail': '配置接码邮箱服务与连接参数',
@@ -130,7 +130,7 @@ onBeforeUnmount(() => window.removeEventListener('resize', updateViewport))
       <div class="sidebar-status" :class="{ compact: collapse && !isMobile }">
         <template v-if="!collapse || isMobile">
           <div class="status-heading">
-            <span>账号池</span>
+            <span>邮箱池</span>
             <strong>{{ stats.total || 0 }}</strong>
           </div>
           <div class="status-track"><span :style="{ width: completionRate + '%' }" /></div>
@@ -139,7 +139,7 @@ onBeforeUnmount(() => window.removeEventListener('resize', updateViewport))
             <span>完成 {{ completionRate }}%</span>
           </div>
         </template>
-        <el-tooltip v-else content="查看账号池" placement="right">
+        <el-tooltip v-else content="查看邮箱列表" placement="right">
           <el-button text circle @click="router.push('/pool')">
             <el-icon :size="18"><Files /></el-icon>
           </el-button>

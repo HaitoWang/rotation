@@ -369,7 +369,6 @@ def build_cpa_token_json(cred: dict) -> dict:
     refresh_token = str(cred.get("refresh_token") or "").strip()
     id_token = str(cred.get("id_token") or "").strip()
     email = str(cred.get("email") or "").strip()
-
     if not id_token:
         id_token = _build_compat_id_token(access_token=access_token, email=email)
 
@@ -523,6 +522,9 @@ def build_sub2api_payload(
     refresh_token = str(cred.get("refresh_token") or "").strip()
     id_token = str(cred.get("id_token") or "").strip()
     email = str(cred.get("email") or "").strip()
+    # Hub 的展示名称可由调用方覆盖（例如重授权后的账号），凭证里的
+    # email 始终保留真实邮箱，避免影响账号识别和后续授权。
+    display_name = str(cred.get("name") or email).strip() or email
 
     access_payload = _decode_jwt_payload(access_token)
     access_auth = _get_auth(access_payload)
@@ -573,7 +575,7 @@ def build_sub2api_payload(
     model_mapping["codex-main"] = model
 
     return {
-        "name": email,
+        "name": display_name,
         "notes": str(cred.get("notes") or "批量导入"),
         "platform": "openai",
         "type": "oauth",
@@ -639,7 +641,13 @@ def export_to_sub2api(cred: dict, cfg: dict, *,
     payload = {"accounts": [account_payload]}
     email = account_payload.get("name") or "unknown"
     url = f"{api_url}/api/v1/admin/accounts/batch"
-    idempotency_seed = f"{email}\0{account_payload['credentials'].get('chatgpt_account_id', '')}"
+    access_token_fingerprint = hashlib.sha256(
+        account_payload["credentials"]["access_token"].encode("utf-8")
+    ).hexdigest()[:16]
+    idempotency_seed = (
+        f"{email}\0{account_payload['credentials'].get('chatgpt_account_id', '')}"
+        f"\0{access_token_fingerprint}"
+    )
     idempotency_key = "openai-oauth-import-" + hashlib.sha256(
         idempotency_seed.encode("utf-8")
     ).hexdigest()[:24]
@@ -862,7 +870,8 @@ def test_sub2api(cfg: dict) -> dict:
 def run_exports(cred: dict, *,
                   cpa_cfg: Optional[dict] = None,
                   sub2api_cfg: Optional[dict] = None,
-                  log_fn: Optional[Callable[[str, str], None]] = None) -> dict:
+                  log_fn: Optional[Callable[[str, str], None]] = None,
+                  token_update_fn: Optional[Callable[[dict], None]] = None) -> dict:
     """注册完成后的可选导出入口。
 
     步骤：
@@ -892,6 +901,15 @@ def run_exports(cred: dict, *,
             "refresh_token": fresh.get("refresh_token") or cred.get("refresh_token"),
             "id_token":      fresh.get("id_token") or cred.get("id_token", ""),
         }
+        if token_update_fn is not None:
+            try:
+                token_update_fn({
+                    "email": cred.get("email") or "",
+                    "refresh_token": cred.get("refresh_token") or "",
+                    "id_token": cred.get("id_token") or "",
+                })
+            except Exception as update_exc:
+                log(f"[exporter] Codex 滚动 Token 写回失败: {update_exc}", "warn")
         log(
             f"[exporter] ✅ Codex token 刷新成功 "
             f"(access_token len={len(fresh['access_token'])} "

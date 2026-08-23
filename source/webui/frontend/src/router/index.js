@@ -43,7 +43,7 @@ const routes = [
     path: '/registered',
     name: 'registered',
     component: () => import('@/views/Registered.vue'),
-    meta: { title: '注册结果', icon: 'CircleCheck', group: '数据' },
+    meta: { title: '账号池', icon: 'CircleCheck', group: '数据' },
   },
   {
     path: '/team',
