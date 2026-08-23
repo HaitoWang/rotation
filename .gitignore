@@ -20,7 +20,7 @@ backend/data/
 backend/logs/
 source/data/.sms*
 source/webui/logs/
-source/webui/static/
+backend/app/webui/static/
 
 # Python
 __pycache__/
