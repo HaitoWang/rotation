@@ -51,7 +51,10 @@ _lock = threading.RLock()
 #    一个 run 的日志全在自己那条线程上产生，所以线程绑定就能干净切开。
 _current_run = threading.local()
 
-LOG_DIR = Path(__file__).resolve().parent / "logs"
+# Keep run logs beside the SQLite database. In Docker this resolves to
+# /app/data/logs, which is backed by the host ./state volume and survives
+# image rebuilds/container recreation.
+LOG_DIR = Path(os.getenv("WEBUI_LOG_DIR") or (db.DB_PATH.parent / "logs"))
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 

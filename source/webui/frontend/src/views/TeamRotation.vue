@@ -63,6 +63,7 @@ const memberFilterOptions = computed(() => [
   { value: 'all', label: '全部', count: status.value.members.length },
   { value: 'active', label: '使用中', count: status.value.members.filter((item) => item.status === 'active').length },
   { value: 'pending', label: '待加入', count: status.value.members.filter((item) => item.status === 'pending').length },
+  { value: 'auth_required', label: '待重授权', count: status.value.members.filter((item) => item.status === 'auth_required').length },
   { value: 'exhausted', label: '已轮出', count: status.value.members.filter((item) => item.status === 'exhausted').length },
   { value: 'failed', label: '异常', count: status.value.members.filter((item) => item.status === 'failed').length },
 ].filter((item) => item.value === 'all' || item.count > 0))
@@ -109,6 +110,7 @@ function usageOf(row) {
 function statusTag(value) {
   return {
     pending: ['待加入', 'warning'],
+    auth_required: ['待人工重授权', 'warning'],
     active: ['使用中', 'success'],
     exhausted: ['额度耗尽', 'danger'],
     removed: ['已移出', 'info'],

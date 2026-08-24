@@ -27,6 +27,10 @@ class TeamApiError(RuntimeError):
     pass
 
 
+class TeamChildAuthInvalidError(TeamApiError):
+    """The child account must be manually reauthorized before another join."""
+
+
 def _decode_jwt_payload(token: str) -> dict:
     try:
         part = str(token or "").split(".")[1]
@@ -548,6 +552,22 @@ class TeamService:
             empty_body=True,
             retries=2,
         )
+        payload_preview = (
+            json.dumps(payload, ensure_ascii=False)
+            if isinstance(payload, (dict, list))
+            else str(payload)
+        )
+        auth_invalid = status == 401 or (
+            status == 403
+            and any(
+                marker in payload_preview.lower()
+                for marker in ("token_invalidated", "authentication token", "session has ended")
+            )
+        )
+        if auth_invalid:
+            raise TeamChildAuthInvalidError(
+                f"子号接受邀请失败: HTTP {status}, {payload_preview[:500]}"
+            )
         self._require(status, payload, "子号接受邀请")
 
         member_id = child.user_id
@@ -745,6 +765,14 @@ class TeamRotationController:
             self._next_cycle_at = time.time()
             self._wake_event.set()
         return {"ok": True, **self.snapshot()}
+
+    def notify_candidate_available(self) -> None:
+        """Wake a running rotation after manual reauthorization releases an account."""
+        with self._lock:
+            if self._state != RotationState.RUNNING:
+                return
+            self._next_cycle_at = time.time()
+            self._wake_event.set()
 
     def snapshot(self) -> dict:
         with self._lock:
@@ -1018,6 +1046,21 @@ class TeamRotationController:
                     continue
                 try:
                     joined = service.invite_and_accept(mother, account)
+                except TeamChildAuthInvalidError as exc:
+                    db.update_team_rotation_member(
+                        claim["id"],
+                        status="auth_required",
+                        error="等待账号池手动重授权",
+                    )
+                    self._event(
+                        "WARNING",
+                        "join",
+                        f"{exc}；已跳过并切换下一个账号",
+                        mother_id,
+                        claim["email"],
+                    )
+                    candidate_available = db.has_team_rotation_candidate(mother_id)
+                    continue
                 except Exception as exc:
                     db.update_team_rotation_member(claim["id"], status="failed", error=str(exc)[:1000])
                     self._event("ERROR", "join", str(exc), mother_id, claim["email"])
@@ -1046,7 +1089,7 @@ class TeamRotationController:
                 candidate_available = db.has_team_rotation_candidate(mother_id)
 
             if remaining > 0 and not candidate_available and (force_team_refresh or removed_count):
-                self._event("WARNING", "pool", "注册成功账号池已无可用 Access Token", mother_id)
+                self._event("WARNING", "pool", "账号池已无可用完整凭证账号", mother_id)
 
             if joined_count:
                 seats["remaining_default"] = remaining
@@ -1262,6 +1305,7 @@ __all__ = [
     "Credentials",
     "RotationState",
     "TeamApiError",
+    "TeamChildAuthInvalidError",
     "TeamRotationController",
     "TeamService",
     "_remaining_default_seats",

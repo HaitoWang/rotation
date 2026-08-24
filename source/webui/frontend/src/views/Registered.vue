@@ -6,6 +6,7 @@ import {
   listRegistered, getRegistered, deleteRegistered,
   bulkDeleteRegistered, checkPlus,
   listExportFormats, exportRegistered, updateCredentials, reauthorizeRegistered,
+  bulkReauthorizeRegistered,
 } from '@/api/register'
 import { copyText, fmtTime } from '@/api/request'
 import { useFormStore } from '@/stores/form'
@@ -25,6 +26,7 @@ const loading = ref(false)
 const checking = ref(false)
 const checkResult = ref('')
 const reauthorizing = ref('')
+const batchReauthorizing = ref(false)
 
 const PLUS_TYPE = {
   plus_eligible: 'success', plus_active: 'primary', free: 'warning',
@@ -122,6 +124,50 @@ async function reauthorize(row) {
     ElMessage.error('重授权失败: ' + e.message)
   } finally {
     reauthorizing.value = ''
+  }
+}
+
+async function reauthorizeSelected() {
+  const emails = selected.value.map((row) => row.email)
+  if (!emails.length) return
+  try {
+    await ElMessageBox.confirm(
+      `批量重新授权选中的 ${emails.length} 个账号？\n\n` +
+      '默认同时处理 2 个账号，过程中可能需要邮箱验证码、2FA 或手机号接码。',
+      '批量重授权',
+      { type: 'warning', confirmButtonText: '开始批量重授权', cancelButtonText: '取消' },
+    )
+  } catch { return }
+
+  batchReauthorizing.value = true
+  try {
+    const result = await bulkReauthorizeRegistered(
+      emails,
+      form.value.proxy.trim(),
+      2,
+    )
+    await load()
+    if (!result.failed) {
+      ElMessage.success(`批量重授权完成：成功 ${result.success} 个`)
+      return
+    }
+
+    const failures = (result.results || []).filter((item) => !item.ok)
+    const visible = failures.slice(0, 20).map(
+      (item) => `${item.email}: ${item.error || '未知错误'}`,
+    )
+    if (failures.length > visible.length) {
+      visible.push(`另有 ${failures.length - visible.length} 个失败，请到运行记录查看`)
+    }
+    await ElMessageBox.alert(
+      `成功 ${result.success} 个，失败 ${result.failed} 个。\n\n${visible.join('\n')}`,
+      '批量重授权完成',
+      { type: 'warning', confirmButtonText: '知道了' },
+    )
+  } catch (e) {
+    ElMessage.error('批量重授权失败: ' + e.message)
+  } finally {
+    batchReauthorizing.value = false
   }
 }
 
@@ -360,7 +406,16 @@ onActivated(() => load())
         </el-dropdown>
         <span class="toolbar-spacer" />
         <span v-if="selected.length" class="selected-badge">已选择 {{ selected.length }} 项</span>
-        <el-dropdown trigger="click" @command="handleDeleteCommand">
+        <el-button
+          type="primary"
+          plain
+          :loading="batchReauthorizing"
+          :disabled="!selected.length || Boolean(reauthorizing)"
+          @click="reauthorizeSelected"
+        >
+          <el-icon><RefreshRight /></el-icon>批量重授权<span v-if="selected.length"> ({{ selected.length }})</span>
+        </el-button>
+        <el-dropdown trigger="click" :disabled="batchReauthorizing" @command="handleDeleteCommand">
           <el-button type="danger" plain>删除<el-icon class="el-icon--right"><ArrowDown /></el-icon></el-button>
           <template #dropdown>
             <el-dropdown-menu>
@@ -453,7 +508,7 @@ onActivated(() => load())
                 text
                 type="primary"
                 :loading="reauthorizing === row.email"
-                :disabled="Boolean(reauthorizing) && reauthorizing !== row.email"
+                :disabled="batchReauthorizing || (Boolean(reauthorizing) && reauthorizing !== row.email)"
                 @click="reauthorize(row)"
               >
                 <el-icon><RefreshRight /></el-icon>重授权

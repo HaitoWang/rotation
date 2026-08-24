@@ -1363,9 +1363,15 @@ def claim_team_rotation_candidate(mother_id: str) -> Optional[dict]:
                 "SELECT r.email, tm.id AS assignment_id, "
                 "tm.mother_id AS previous_mother_id "
                 "FROM registered AS r "
+                "LEFT JOIN outlook_accounts AS o "
+                "ON lower(o.email)=lower(r.email) "
                 "LEFT JOIN team_rotation_members AS tm "
                 "ON lower(tm.email)=lower(r.email) "
-                "WHERE coalesce(r.deleted_at, 0)=0 AND length(r.access_token)>0 "
+                "WHERE coalesce(r.deleted_at, 0)=0 "
+                "AND length(trim(coalesce(r.access_token, '')))>0 "
+                "AND length(trim(coalesce(r.session_token, '')))>0 "
+                "AND length(trim(coalesce(r.refresh_token, '')))>0 "
+                "AND (o.email IS NULL OR o.status='done') "
                 "AND (tm.id IS NULL OR ("
                 "  tm.status IN ('exhausted','removed') AND tm.mother_id<>?"
                 ")) "
@@ -1429,9 +1435,15 @@ def has_team_rotation_candidate(mother_id: str) -> bool:
     try:
         row = con.execute(
             "SELECT 1 FROM registered AS r "
+            "LEFT JOIN outlook_accounts AS o "
+            "ON lower(o.email)=lower(r.email) "
             "LEFT JOIN team_rotation_members AS tm "
             "ON lower(tm.email)=lower(r.email) "
-            "WHERE coalesce(r.deleted_at, 0)=0 AND length(r.access_token)>0 "
+            "WHERE coalesce(r.deleted_at, 0)=0 "
+            "AND length(trim(coalesce(r.access_token, '')))>0 "
+            "AND length(trim(coalesce(r.session_token, '')))>0 "
+            "AND length(trim(coalesce(r.refresh_token, '')))>0 "
+            "AND (o.email IS NULL OR o.status='done') "
             "AND (tm.id IS NULL OR ("
             "  tm.status IN ('exhausted','removed') AND tm.mother_id<>?"
             ")) LIMIT 1",
@@ -1466,6 +1478,25 @@ def update_team_rotation_member(member_row_id: int, **fields) -> None:
                 values,
             )
             con.commit()
+        finally:
+            con.close()
+
+
+def release_team_rotation_auth_required(email: str) -> bool:
+    """Return a manually reauthorized child to the normal candidate pool."""
+    normalized = str(email or "").strip().lower()
+    if not normalized:
+        return False
+    with _lock:
+        con = _conn()
+        try:
+            rc = con.execute(
+                "DELETE FROM team_rotation_members "
+                "WHERE lower(email)=lower(?) AND status='auth_required'",
+                (normalized,),
+            )
+            con.commit()
+            return rc.rowcount > 0
         finally:
             con.close()
 
@@ -2035,6 +2066,17 @@ def finish_run(run_id: str, status: str, error: str = "", category: str = "") ->
             (status, time.time(), (error or "")[:500], category or None, run_id),
         )
         con.commit()
+
+
+def get_run(run_id: str) -> Optional[dict]:
+    con = _conn()
+    try:
+        row = con.execute(
+            "SELECT * FROM runs WHERE run_id=?", (str(run_id or "").strip(),)
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        con.close()
 
 
 def list_runs(limit: int = 50) -> list[dict]:

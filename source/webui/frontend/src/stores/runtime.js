@@ -93,14 +93,27 @@ export const useRuntimeStore = defineStore('runtime', () => {
         try {
           const d = JSON.parse(e.data)
           addLog(`[auto] 开始注册 ${d.email} (run=${d.run_id})`, 'evt')
-          streamRun(d.run_id) // 复用单跑 SSE，接管日志
+        } catch (_) {}
+      },
+      run_log: (e) => {
+        try {
+          const d = JSON.parse(e.data)
+          if (d.line) addLog(`[${d.email}][${d.run_id}] ${d.line}`)
+        } catch (_) {}
+      },
+      run_phase: (e) => {
+        try {
+          const d = JSON.parse(e.data)
+          const detail = d.message ? ` ${d.message}` : ''
+          addLog(`phase=${d.phase} email=${d.email}${detail}`, 'evt')
         } catch (_) {}
       },
       run_finished: (e) => {
         try {
           const d = JSON.parse(e.data)
           const tag = d.ok ? '[成功]' : (d.category === 'network' ? '[网络错误，正在换代理重试]' : '[失败]')
-          addLog(`[auto] ${tag} ${d.email} 完成`, d.ok ? 'ok' : 'err')
+          const detail = !d.ok && d.error ? `: ${d.error}` : ''
+          addLog(`[auto] ${tag} ${d.email} 完成 (run=${d.run_id})${detail}`, d.ok ? 'ok' : 'err')
           useStatsStore().refresh()
           bumpData()
         } catch (_) {}

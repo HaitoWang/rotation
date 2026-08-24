@@ -90,6 +90,44 @@ class AutoLoopProxyTests(unittest.TestCase):
         finally:
             registrar.remove_run_observer(run_id)
 
+    def test_auto_stream_forwards_each_run_log_and_phase(self):
+        controller = AutoLoopController()
+        controller._broadcast = mock.Mock()
+
+        controller._forward_run_event(
+            "run-1", "first@example.com", "log", {"message": "sentinel failed"}
+        )
+        controller._forward_run_event(
+            "run-2", "second@example.com", "phase", {
+                "phase": "sms",
+                "message": "waiting for code",
+            }
+        )
+
+        self.assertEqual(controller._broadcast.call_args_list, [
+            mock.call("run_log", {
+                "run_id": "run-1",
+                "email": "first@example.com",
+                "line": "sentinel failed",
+            }),
+            mock.call("run_phase", {
+                "run_id": "run-2",
+                "email": "second@example.com",
+                "phase": "sms",
+                "message": "waiting for code",
+            }),
+        ])
+
+    def test_frontend_auto_stream_does_not_replace_concurrent_run_streams(self):
+        runtime = (
+            ROOT / "webui" / "frontend" / "src" / "stores" / "runtime.js"
+        ).read_text(encoding="utf-8")
+        self.assertIn("run_log: (e) =>", runtime)
+        self.assertIn("run_phase: (e) =>", runtime)
+        self.assertIn("[${d.email}][${d.run_id}] ${d.line}", runtime)
+        self.assertIn("d.error", runtime)
+        self.assertNotIn("streamRun(d.run_id)", runtime)
+
     def test_snapshot_reports_effective_concurrency_and_stuck_tasks(self):
         controller = AutoLoopController()
         controller._state = "running"

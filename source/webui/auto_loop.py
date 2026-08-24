@@ -377,6 +377,26 @@ class AutoLoopController:
             info["last_activity_at"] = time.time()
             return current != previous
 
+    def _forward_run_event(
+        self,
+        run_id: str,
+        email: str,
+        kind: str,
+        payload: dict,
+    ) -> None:
+        """Forward per-run output through the one scalable auto-loop SSE."""
+        base = {"run_id": run_id, "email": email}
+        if kind == "log":
+            line = str(payload.get("message") or "")
+            if line:
+                self._broadcast("run_log", {**base, "line": line})
+        elif kind == "phase":
+            self._broadcast("run_phase", {
+                **base,
+                "phase": str(payload.get("phase") or ""),
+                "message": str(payload.get("message") or ""),
+            })
+
     def _record_finish(self, ok: bool, category: str):
         """worker 结束一个最终 run 后更新成功/失败计数。"""
         with self._lock:
@@ -531,12 +551,22 @@ class AutoLoopController:
             try:
                 phase_box = {"phase": "启动注册"}
 
-                def observe(observed_run_id, kind, payload, wid=worker_id, box=phase_box):
+                def observe(
+                    observed_run_id,
+                    kind,
+                    payload,
+                    wid=worker_id,
+                    box=phase_box,
+                    run_email=account["email"],
+                ):
                     with self._lock:
                         previous = box["phase"]
                         box["phase"] = _phase_from_event(kind, payload, previous)
                     changed = box["phase"] != previous
                     changed = self._observe_run(wid, observed_run_id, kind, payload) or changed
+                    self._forward_run_event(
+                        observed_run_id, run_email, kind, payload
+                    )
                     if changed:
                         self._broadcast("state", self._snapshot())
 
@@ -590,6 +620,8 @@ class AutoLoopController:
 
             with self._lock:
                 self._worker_status.pop(worker_id, None)
+            run_record = db.get_run(run_id) or {}
+            run_error = str(run_record.get("error") or "").strip()
             self._broadcast("state", self._snapshot())
             self._broadcast("run_finished", {
                 "worker_id": worker_id,
@@ -597,6 +629,7 @@ class AutoLoopController:
                 "run_id": run_id,
                 "ok": ok,
                 "category": category,
+                "error": run_error,
             })
 
             if not ok and category == "stuck":

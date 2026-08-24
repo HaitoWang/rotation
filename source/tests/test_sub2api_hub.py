@@ -6,7 +6,11 @@ from pathlib import Path
 from unittest import mock
 
 from webui import db, exporter, registrar
-from webui.team_rotation import TeamRotationController
+from webui.team_rotation import (
+    TeamChildAuthInvalidError,
+    TeamRotationController,
+    TeamService,
+)
 
 
 def _jwt(payload: dict) -> str:
@@ -280,6 +284,7 @@ class TeamRotationHubStateTests(unittest.TestCase):
         db.save_registered({
             "email": "child@example.com",
             "access_token": "web-access-token",
+            "session_token": "session-token",
             "refresh_token": "refresh-token",
         })
         self.mother = db.create_team_mother({
@@ -450,6 +455,126 @@ class TeamRotationHubStateTests(unittest.TestCase):
         self.assertEqual(recycled["member_id"], "member-b")
         self.assertEqual(recycled["hub_status"], "pending")
         push.assert_called_once()
+
+    def test_join_401_skips_to_next_account_without_reauthorizing(self):
+        for created_at, email in (
+            (100.0, "invalid@example.com"),
+            (200.0, "healthy@example.com"),
+        ):
+            db.save_registered({
+                "email": email,
+                "access_token": f"access-{email}",
+                "session_token": f"session-{email}",
+                "refresh_token": f"refresh-{email}",
+            })
+            con = db._conn()
+            con.execute(
+                "UPDATE registered SET created_at=? WHERE email=?",
+                (created_at, email),
+            )
+            con.commit()
+
+        service = mock.Mock()
+        service.get_team_detail.return_value = {
+            "seats": {"entitled": 3, "in_use": 1, "remaining_default": 2},
+            "members": [{"id": "member-1", "email": "child@example.com"}],
+        }
+        service.check_quota.return_value = {
+            "status": "alive",
+            "http_status": 200,
+            "primary_used_percent": 10.0,
+            "secondary_used_percent": 5.0,
+            "error": "",
+        }
+        service.invite_and_accept.side_effect = [
+            TeamChildAuthInvalidError("子号接受邀请失败: HTTP 401, token_invalidated"),
+            {"member_id": "member-healthy"},
+        ]
+        controller = TeamRotationController(
+            service_factory=mock.Mock(return_value=service)
+        )
+
+        with mock.patch.object(controller, "_push_assignment_to_hub"), mock.patch(
+            "webui.registrar.reauthorize_registered_account"
+        ) as reauthorize:
+            controller._process_mother(self.mother)
+
+        self.assertEqual(service.invite_and_accept.call_count, 2)
+        reauthorize.assert_not_called()
+        invalid = db.find_team_rotation_member(
+            self.mother["id"], "invalid@example.com"
+        )
+        healthy = db.find_team_rotation_member(
+            self.mother["id"], "healthy@example.com"
+        )
+        self.assertEqual(invalid["status"], "auth_required")
+        self.assertEqual(invalid["error"], "等待账号池手动重授权")
+        self.assertEqual(healthy["status"], "active")
+        self.assertEqual(healthy["member_id"], "member-healthy")
+
+    def test_manual_reauthorization_returns_waiting_account_to_pool(self):
+        db.update_team_rotation_member(
+            self.assignment["id"],
+            status="auth_required",
+            error="等待账号池手动重授权",
+        )
+
+        self.assertFalse(db.has_team_rotation_candidate(self.mother["id"]))
+        self.assertTrue(db.release_team_rotation_auth_required("child@example.com"))
+        self.assertIsNone(db.find_team_rotation_member(
+            self.mother["id"], "child@example.com"
+        ))
+        self.assertTrue(db.has_team_rotation_candidate(self.mother["id"]))
+        claim = db.claim_team_rotation_candidate(self.mother["id"])
+        self.assertEqual(claim["email"], "child@example.com")
+        self.assertFalse(claim["recycled"])
+
+    def test_candidate_requires_complete_tokens_and_done_mailbox(self):
+        db.save_registered({
+            "email": "incomplete@example.com",
+            "access_token": "access-incomplete",
+            "refresh_token": "refresh-incomplete",
+        })
+        db.save_registered({
+            "email": "staged@example.com",
+            "access_token": "access-staged",
+            "session_token": "session-staged",
+            "refresh_token": "refresh-staged",
+        })
+        con = db._conn()
+        con.execute(
+            "INSERT INTO outlook_accounts "
+            "(email, kind, status, imported_at) VALUES (?, 'icloud', 'available', ?)",
+            ("staged@example.com", 100.0),
+        )
+        con.commit()
+
+        self.assertFalse(db.has_team_rotation_candidate(self.mother["id"]))
+        db.mark_done("staged@example.com")
+        self.assertTrue(db.has_team_rotation_candidate(self.mother["id"]))
+        claim = db.claim_team_rotation_candidate(self.mother["id"])
+        self.assertEqual(claim["email"], "staged@example.com")
+
+    def test_service_classifies_child_accept_401_as_auth_invalid(self):
+        with mock.patch("webui.team_rotation.TeamApiClient") as client_cls:
+            client_cls.return_value.request.return_value = (
+                401,
+                {"error": {"code": "token_invalidated"}},
+            )
+            service = TeamService()
+            with mock.patch.object(
+                service,
+                "_mother_request",
+                return_value=(200, {"success": True}),
+            ):
+                with self.assertRaises(TeamChildAuthInvalidError):
+                    service.invite_and_accept(
+                        self.mother,
+                        {
+                            "email": "invalid@example.com",
+                            "access_token": "invalid-access",
+                        },
+                    )
 
     def _quota_service(self, *quota_results):
         service = mock.Mock()

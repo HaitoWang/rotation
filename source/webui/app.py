@@ -972,30 +972,98 @@ class ReauthorizeRegisteredReq(BaseModel):
     proxy: str = Field("", description="重新授权使用的代理，留空直连")
 
 
-@app.post("/api/registered/reauthorize")
-def api_reauthorize_registered(req: ReauthorizeRegisteredReq):
-    """重新登录已有账号并刷新 Web 与 Codex OAuth 凭证。"""
-    email = (req.email or "").strip().lower()
-    if not email:
-        raise HTTPException(400, "email 不能为空")
-    if not db.get_registered(email):
-        raise HTTPException(404, f"账号池中未找到账号: {email}")
+def _reauthorize_registered_payload(email: str, proxy: str = "") -> dict:
+    normalized = str(email or "").strip().lower()
+    if not normalized:
+        return {"ok": False, "email": normalized, "error": "email 不能为空"}
+    if not db.get_registered(normalized):
+        return {
+            "ok": False,
+            "email": normalized,
+            "error": f"账号池中未找到账号: {normalized}",
+        }
 
     result = registrar.reauthorize_registered_account(
-        email,
-        proxy=(req.proxy or "").strip(),
+        normalized,
+        proxy=str(proxy or "").strip(),
     )
     if not result.get("ok"):
-        raise HTTPException(400, result.get("error") or "重授权失败")
+        return {
+            "ok": False,
+            "email": normalized,
+            "error": result.get("error") or "重授权失败",
+            "run_id": result.get("run_id") or "",
+        }
 
-    account = result.get("account") or db.get_registered(email) or {}
-    logger.info("[registered] 重授权成功 email=%s", email)
+    account = result.get("account") or db.get_registered(normalized) or {}
+    team_rotation_released = db.release_team_rotation_auth_required(normalized)
     return {
         "ok": True,
-        "email": email,
+        "email": normalized,
+        "run_id": result.get("run_id") or "",
         "access_token_len": len(account.get("access_token") or ""),
         "session_token_len": len(account.get("session_token") or ""),
         "refresh_token_len": len(account.get("refresh_token") or ""),
+        "team_rotation_released": team_rotation_released,
+    }
+
+
+@app.post("/api/registered/reauthorize")
+def api_reauthorize_registered(req: ReauthorizeRegisteredReq):
+    """重新登录已有账号并刷新 Web 与 Codex OAuth 凭证。"""
+    result = _reauthorize_registered_payload(req.email, req.proxy)
+    if not result.get("ok"):
+        raise HTTPException(400, result.get("error") or "重授权失败")
+
+    if result.get("team_rotation_released"):
+        TEAM_ROTATION.notify_candidate_available()
+    logger.info("[registered] 重授权成功 email=%s", result["email"])
+    return result
+
+
+class BulkReauthorizeRegisteredReq(BaseModel):
+    emails: list[str] = Field(..., description="要批量重新授权的账号邮箱")
+    proxy: str = Field("", description="重新授权使用的代理，留空直连")
+    concurrency: int = Field(2, ge=1, le=5, description="批量重授权并发数")
+
+
+@app.post("/api/registered/bulk_reauthorize")
+def api_bulk_reauthorize_registered(req: BulkReauthorizeRegisteredReq):
+    """并发刷新一批已有账号的 Web 与 Codex OAuth 凭证。"""
+    emails = list(dict.fromkeys(
+        str(email or "").strip().lower()
+        for email in req.emails
+        if str(email or "").strip()
+    ))
+    if not emails:
+        raise HTTPException(400, "至少选择一个账号")
+    if len(emails) > 100:
+        raise HTTPException(400, "单次最多批量重授权 100 个账号")
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    proxy = str(req.proxy or "").strip()
+    workers = min(max(1, int(req.concurrency)), len(emails))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        results = list(executor.map(
+            lambda email: _reauthorize_registered_payload(email, proxy),
+            emails,
+        ))
+
+    success = sum(1 for item in results if item.get("ok"))
+    failed = len(results) - success
+    if any(item.get("team_rotation_released") for item in results):
+        TEAM_ROTATION.notify_candidate_available()
+    logger.info(
+        "[registered] 批量重授权完成 total=%s success=%s failed=%s concurrency=%s",
+        len(results), success, failed, workers,
+    )
+    return {
+        "ok": failed == 0,
+        "total": len(results),
+        "success": success,
+        "failed": failed,
+        "results": results,
     }
 
 

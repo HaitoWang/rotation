@@ -27,6 +27,13 @@ export const reauthorizeRegistered = (email, proxy = '') =>
     { timeout: 15 * 60 * 1000 },
   )
 
+export const bulkReauthorizeRegistered = (emails, proxy = '', concurrency = 2) =>
+  http.post(
+    '/api/registered/bulk_reauthorize',
+    { emails, proxy, concurrency },
+    { timeout: 60 * 60 * 1000 },
+  )
+
 export const bulkDeleteRegistered = (payload) =>
   http.post('/api/registered/bulk_delete', payload) // { emails } 或 { all: true }
 

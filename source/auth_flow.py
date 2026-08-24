@@ -1673,11 +1673,29 @@ class AuthFlow:
                     and self._sms_callback is not None:
                 logger.info("Codex 授权直接落到 /add-phone，尝试 SMS 接码绑号 ...")
                 try:
-                    self._handle_add_phone_via_sms(continue_url=final_url)
-                    # 绑号成功后重新 authorize 拿 callback code
-                    callback_url, final_url = self._follow_authorize_for_callback(
-                        auth_url, redirect_uri, "codex_authorize_after_add_phone"
+                    phone_next_url = self._normalize_continue_url(
+                        self._handle_add_phone_via_sms(continue_url=final_url)
                     )
+                    # phone-otp/validate may return the Codex callback directly.
+                    # Preserve that one-time code instead of discarding it and
+                    # starting a new authorize transaction.
+                    if self._callback_has_code(phone_next_url, redirect_uri):
+                        callback_url = phone_next_url
+                        final_url = phone_next_url
+                    elif phone_next_url and not self._is_add_phone_state(
+                        page_type="", continue_url=phone_next_url
+                    ):
+                        callback_url, final_url = self._follow_authorize_for_callback(
+                            phone_next_url,
+                            redirect_uri,
+                            "codex_post_add_phone",
+                        )
+                    if not callback_url:
+                        # Some responses only confirm the phone binding. Start a
+                        # fresh authorize transaction after that confirmation.
+                        callback_url, final_url = self._follow_authorize_for_callback(
+                            auth_url, redirect_uri, "codex_authorize_after_add_phone"
+                        )
                     if not callback_url:
                         no_prompt_url = self._drop_query_keys(auth_url, {"prompt"})
                         if no_prompt_url and no_prompt_url != auth_url:
