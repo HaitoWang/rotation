@@ -10,12 +10,12 @@ const apiKey = ref('')
 const apiKeyPh = ref('粘贴接码平台 API Key')
 const country = ref('150')
 const service = ref('dr')
-const maxPrice = ref('')
+const maxPrice = ref('0.15')
 const phoneSuccessMax = ref('3')
 const reusePhone = ref(false)
 const autoCountry = ref(false)
 const autoMinStock = ref('20')
-const autoMaxPrice = ref('')
+const autoMaxPrice = ref('0.15')
 const allowed = ref([]) // 允许国家 id 数组
 const maxPhoneAttempts = ref('')
 const perPhoneTimeout = ref('80')
@@ -69,12 +69,12 @@ async function load() {
     apiKeyPh.value = config.sms_api_key === '***' ? '已设置（留空不修改）' : '粘贴接码平台 API Key'
     country.value = config.sms_country || '150'
     service.value = config.sms_service || 'dr'
-    maxPrice.value = config.sms_max_price || ''
+    maxPrice.value = String(Math.min(Number(config.sms_max_price) || 0.15, 0.15))
     phoneSuccessMax.value = config.sms_phone_success_max || '3'
     reusePhone.value = config.sms_reuse_phone === '1'
     autoCountry.value = config.sms_auto_country === '1'
     autoMinStock.value = config.sms_auto_min_stock || '20'
-    autoMaxPrice.value = config.sms_auto_max_price || ''
+    autoMaxPrice.value = String(Math.min(Number(config.sms_auto_max_price) || 0.15, 0.15))
     allowed.value = (config.sms_allowed_countries || '').split(',').map((s) => s.trim()).filter(Boolean)
     maxPhoneAttempts.value = config.sms_max_phone_attempts || ''
     perPhoneTimeout.value = config.sms_per_phone_timeout || '80'
@@ -101,13 +101,13 @@ async function save() {
       sms_api_key: apiKey.value.trim() || '***',
       sms_country: String(country.value || '').trim() || '52',
       sms_service: service.value.trim() || 'dr',
-      sms_max_price: maxPrice.value.trim(),
+      sms_max_price: maxPrice.value.trim() || '0.15',
       sms_phone_success_max: phoneSuccessMax.value.trim() || '3',
       sms_reuse_phone: reusePhone.value ? '1' : '0',
       sms_auto_country: autoCountry.value ? '1' : '0',
       sms_allowed_countries: allowed.value.join(','),
       sms_auto_min_stock: autoMinStock.value.trim() || '20',
-      sms_auto_max_price: autoMaxPrice.value.trim(),
+      sms_auto_max_price: autoMaxPrice.value.trim() || '0.15',
       sms_max_phone_attempts: maxPhoneAttempts.value.trim(),
       sms_per_phone_timeout: perPhoneTimeout.value.trim() || '80',
     })
@@ -196,8 +196,8 @@ onActivated(() => load())
 
         <el-row :gutter="16">
           <el-col :span="12">
-            <el-form-item label="号码硬性最高单价（空=不限）">
-              <el-input v-model="maxPrice" placeholder="0.5" />
+            <el-form-item label="号码硬性最高单价（最高 0.15）">
+              <el-input v-model="maxPrice" type="number" min="0.001" max="0.15" step="0.001" placeholder="0.15" />
             </el-form-item>
           </el-col>
           <el-col :span="12">
@@ -221,8 +221,8 @@ onActivated(() => load())
             </el-form-item>
           </el-col>
           <el-col :span="12">
-            <el-form-item label="优先价格阈值（0=不限，阈值外作兜底）">
-              <el-input v-model="autoMaxPrice" placeholder="0" />
+            <el-form-item label="优先价格阈值（最高 0.15）">
+              <el-input v-model="autoMaxPrice" type="number" min="0.001" max="0.15" step="0.001" placeholder="0.15" />
             </el-form-item>
           </el-col>
         </el-row>

@@ -318,6 +318,8 @@ def init_db():
         con.execute("ALTER TABLE team_rotation_members ADD COLUMN hub_last_attempt_at REAL")
     if "hub_error" not in rotation_cols:
         con.execute("ALTER TABLE team_rotation_members ADD COLUMN hub_error TEXT")
+    if "hub_account_id" not in rotation_cols:
+        con.execute("ALTER TABLE team_rotation_members ADD COLUMN hub_account_id TEXT")
     con.commit()
     con.close()
 
@@ -1391,7 +1393,7 @@ def claim_team_rotation_candidate(mother_id: str) -> Optional[dict]:
                     "secondary_used_percent=NULL, joined_at=NULL, "
                     "last_checked_at=NULL, removed_at=NULL, error='', "
                     "hub_status='pending', hub_pushed_at=NULL, "
-                    "hub_last_attempt_at=NULL, hub_error='', "
+                    "hub_last_attempt_at=NULL, hub_error='', hub_account_id=NULL, "
                     "created_at=?, updated_at=? WHERE id=?",
                     (mother_id, now, now, int(assignment_id)),
                 )
@@ -1459,6 +1461,7 @@ def update_team_rotation_member(member_row_id: int, **fields) -> None:
         "member_id", "status", "primary_used_percent", "secondary_used_percent",
         "joined_at", "last_checked_at", "removed_at", "error",
         "hub_status", "hub_pushed_at", "hub_last_attempt_at", "hub_error",
+        "hub_account_id",
     }
     sets = []
     values = []

@@ -28,6 +28,7 @@ import logging
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Optional
+from urllib.parse import quote
 
 logger = logging.getLogger(__name__)
 
@@ -703,10 +704,13 @@ def export_to_sub2api(cred: dict, cfg: dict, *,
                         nested = data.get("data")
                         if isinstance(nested, dict) and not candidates:
                             candidates = nested.get("accounts") or nested.get("results")
-                        if not new_id and isinstance(candidates, list) and candidates:
-                            item = candidates[0]
-                            if isinstance(item, dict):
+                        if not new_id and isinstance(candidates, list):
+                            for item in candidates:
+                                if not isinstance(item, dict) or item.get("success") is False:
+                                    continue
                                 new_id = str(item.get("id") or item.get("ID") or "").strip()
+                                if new_id:
+                                    break
                 except Exception:
                     pass
                 log(f"[SUB2API] ✅ 上传成功 {email} (id={new_id or 'unknown'})", "ok")
@@ -805,6 +809,195 @@ def get_sub2api_groups(cfg: dict) -> dict:
         "groups": groups,
         "message": f"获取到 {len(groups)} 个可用 OpenAI 分组",
     }
+
+
+def _sub2api_admin_get(cfg: dict, path: str) -> tuple[int, Any]:
+    """调用 Sub2API 管理 GET 接口，统一处理认证和 JSON 响应。"""
+    api_url = (cfg.get("sub2api_url") or "").rstrip("/").strip()
+    api_key = (cfg.get("sub2api_api_key") or "").strip()
+    if not api_url:
+        raise RuntimeError("SUB2API 未配置 URL")
+    if not api_key:
+        raise RuntimeError("SUB2API 未配置 API Key")
+    timeout = int(cfg.get("sub2api_timeout") or DEFAULT_TIMEOUT)
+    cffi = _import_cffi()
+    resp = cffi.get(
+        f"{api_url}{path}",
+        headers={
+            "Accept": "application/json, text/plain, */*",
+            "Referer": f"{api_url}/admin/accounts",
+            "x-api-key": api_key,
+        },
+        proxies=None,
+        verify=False,
+        timeout=timeout,
+        impersonate=_IMPERSONATE,
+    )
+    try:
+        payload = resp.json()
+    except Exception:
+        payload = str(getattr(resp, "text", "") or "")[:1000]
+    return int(resp.status_code), payload
+
+
+def _sub2api_payload_data(payload: Any) -> dict:
+    if not isinstance(payload, dict):
+        return {}
+    data = payload.get("data")
+    return data if isinstance(data, dict) else payload
+
+
+def _sub2api_future(value: Any, now: Optional[float] = None) -> bool:
+    """识别 Unix 秒、ISO 时间和数字字符串形式的未来时间。"""
+    if value is None or value == "":
+        return False
+    now = time.time() if now is None else now
+    try:
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value) > now
+        text = str(value).strip()
+        if not text:
+            return False
+        try:
+            return float(text) > now
+        except ValueError:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.timestamp() > now
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def _sub2api_model_limit_active(extra: Any, now: float) -> bool:
+    """兼容 extra.model_rate_limits 的不同版本结构。"""
+    if not isinstance(extra, (dict, list)):
+        return False
+    if isinstance(extra, list):
+        return any(_sub2api_model_limit_active(item, now) for item in extra)
+    for key, value in extra.items():
+        key_text = str(key).lower()
+        if key_text in {"reset_at", "resets_at", "reset_time", "until", "until_unix"}:
+            if _sub2api_future(value, now):
+                return True
+        if isinstance(value, (dict, list)) and _sub2api_model_limit_active(value, now):
+            return True
+    return False
+def get_sub2api_account_status(cfg: dict, account_id: Any) -> dict:
+    """读取一个 Hub 账号的调度状态，不调用 ChatGPT 余额接口。
+
+    返回 classification：healthy、rate_limited、auth_required、error、missing
+    或 hub_error。Admin API 自身的 401/403 不会被误判为子号授权失效。
+    """
+    account_id_text = str(account_id or "").strip()
+    if not account_id_text:
+        return {"ok": False, "classification": "missing", "error": "缺少 Sub2API account_id"}
+    status, payload = _sub2api_admin_get(
+        cfg, f"/api/v1/admin/accounts/{quote(account_id_text, safe='')}"
+    )
+    if status in (401, 403):
+        return {
+            "ok": False,
+            "classification": "hub_error",
+            "http_status": status,
+            "error": f"Sub2API 管理 API 鉴权失败 (HTTP {status})",
+        }
+    if status == 404:
+        return {
+            "ok": False,
+            "classification": "missing",
+            "http_status": status,
+            "error": "Sub2API 账号不存在",
+        }
+    if not 200 <= status < 300:
+        return {
+            "ok": False,
+            "classification": "hub_error",
+            "http_status": status,
+            "error": f"Sub2API 账号状态接口返回 HTTP {status}",
+        }
+    data = _sub2api_payload_data(payload)
+    if not data:
+        return {"ok": False, "classification": "hub_error", "http_status": status, "error": "Sub2API 账号状态响应为空"}
+
+    now = time.time()
+    account_status = str(data.get("status") or "").strip().lower()
+    error_message = str(data.get("error_message") or data.get("error") or "").strip()
+    if account_status == "error":
+        return {
+            "ok": True,
+            "classification": "auth_required",
+            "http_status": status,
+            "account": data,
+            "error": error_message or "Sub2API 账号处于 error 状态",
+        }
+
+    if account_status in {"rate_limited", "limited", "overloaded", "quota_exhausted"}:
+        return {
+            "ok": True,
+            "classification": "rate_limited",
+            "http_status": status,
+            "account": data,
+            "error": error_message or f"Sub2API 账号状态为 {account_status}",
+        }
+
+    if _sub2api_future(data.get("rate_limit_reset_at"), now):
+        return {
+            "ok": True,
+            "classification": "rate_limited",
+            "http_status": status,
+            "account": data,
+            "error": f"Sub2API 账号限流，重置时间 {data.get('rate_limit_reset_at')}",
+        }
+
+    if _sub2api_future(data.get("overload_until"), now):
+        return {
+            "ok": True,
+            "classification": "rate_limited",
+            "http_status": status,
+            "account": data,
+            "error": f"Sub2API 账号处于过载冷却，结束时间 {data.get('overload_until')}",
+        }
+
+    if _sub2api_model_limit_active((data.get("extra") or {}).get("model_rate_limits") if isinstance(data.get("extra"), dict) else None, now):
+        return {
+            "ok": True,
+            "classification": "rate_limited",
+            "http_status": status,
+            "account": data,
+            "error": "Sub2API 账号存在未重置的模型限流",
+        }
+
+    temp_until = data.get("temp_unschedulable_until")
+    if _sub2api_future(temp_until, now):
+        reason = str(data.get("temp_unschedulable_reason") or error_message).strip()
+        lower_reason = reason.lower()
+        auth_markers = ("401", "unauthorized", "token", "session has ended", "invalidated", "refresh")
+        rate_markers = ("rate limit", "rate_limited", "rate-limit", "限流", "overload", "quota")
+        return {
+            "ok": True,
+            "classification": (
+                "rate_limited"
+                if any(marker in lower_reason for marker in rate_markers)
+                else "auth_required"
+                if any(marker in lower_reason for marker in auth_markers)
+                else "error"
+            ),
+            "http_status": status,
+            "account": data,
+            "error": reason or "Sub2API 账号临时停调",
+        }
+
+    if account_status != "active" or data.get("schedulable") is False:
+        return {
+            "ok": True,
+            "classification": "inactive",
+            "http_status": status,
+            "account": data,
+            "error": error_message or f"Sub2API 账号不可调度 (status={account_status or 'unknown'})",
+        }
+
+    return {"ok": True, "classification": "healthy", "http_status": status, "account": data, "error": ""}
 
 
 def test_cpa(cfg: dict) -> dict:

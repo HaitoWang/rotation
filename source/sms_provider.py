@@ -15,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
@@ -152,6 +153,7 @@ def country_label(country_id) -> str:
 SMS_DEFAULT_SERVICE = "dr"
 SMS_DEFAULT_COUNTRY = "52"  # Thailand —— OpenAI 走 SMS 的稳定国家
 SMS_DEFAULT_SUPPLIER_STRATEGY = "success_first"
+SMS_MAX_ALLOWED_PRICE = 0.15  # 项目级硬上限，避免高价号码被目录兜底选中
 SMS_PHONE_LIFETIME = 20 * 60  # 号码租用窗口（秒）
 HERO_CANCEL_MIN_AGE_SECONDS = 125  # HeroSMS 购买约 2 分钟后才允许主动取消
 _SMS_CACHE_LOCK = threading.Lock()
@@ -1145,7 +1147,7 @@ class SmsBowerProvider(BaseSmsProvider):
         platform_key: str = "smsbower",
         default_service: str = SMS_DEFAULT_SERVICE,
         default_country: str = SMS_DEFAULT_COUNTRY,
-        max_price: float = -1,
+        max_price: float = SMS_MAX_ALLOWED_PRICE,
         proxy: Optional[str] = None,
         reuse_phone_to_max: bool = True,
         phone_success_max: int = 3,
@@ -1156,7 +1158,10 @@ class SmsBowerProvider(BaseSmsProvider):
         self.platform_key = str(platform_key or "smsbower").strip().lower()
         self.default_service = str(default_service or SMS_DEFAULT_SERVICE).strip()
         self.default_country = str(default_country or SMS_DEFAULT_COUNTRY).strip()
-        self.max_price = float(max_price or -1)
+        requested_max_price = _safe_float(max_price, SMS_MAX_ALLOWED_PRICE)
+        if not math.isfinite(requested_max_price) or requested_max_price <= 0:
+            requested_max_price = SMS_MAX_ALLOWED_PRICE
+        self.max_price = min(requested_max_price, SMS_MAX_ALLOWED_PRICE)
         self._proxy = (proxy or "").strip() or None
         self._proxies = {"http": self._proxy, "https": self._proxy} if self._proxy else None
         self.reuse_phone_to_max = bool(reuse_phone_to_max)

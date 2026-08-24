@@ -27,6 +27,39 @@ class SmsProviderFactoryTests(unittest.TestCase):
         self.assertEqual([p.platform_key for p in providers], ["smsbower", "herosms"])
         self.assertEqual(providers[1].base_url, "https://hero-sms.com/stubs/handler_api.php")
 
+    def test_provider_price_is_always_capped_at_fifteen_cents(self):
+        default_provider = sms_provider.create_sms_provider("smsbower", {
+            "sms_provider": "smsbower",
+            "sms_api_key": "key",
+            "sms_max_price": "",
+        })
+        expensive_provider = sms_provider.create_sms_provider("smsbower", {
+            "sms_provider": "smsbower",
+            "sms_api_key": "key",
+            "sms_max_price": "1.108",
+        })
+        cheaper_provider = sms_provider.create_sms_provider("smsbower", {
+            "sms_provider": "smsbower",
+            "sms_api_key": "key",
+            "sms_max_price": "0.08",
+        })
+
+        self.assertEqual(default_provider.max_price, 0.15)
+        self.assertEqual(expensive_provider.max_price, 0.15)
+        self.assertEqual(cheaper_provider.max_price, 0.08)
+
+    def test_get_number_request_sends_hard_price_cap(self):
+        provider = sms_provider.create_sms_provider("smsbower", {
+            "sms_provider": "smsbower",
+            "sms_api_key": "key",
+        })
+        response = mock.Mock(status_code=200, text="ACCESS_NUMBER:activation:66123456789")
+
+        with mock.patch.object(provider, "_request", return_value=response) as request:
+            provider._request_number_single_action("getNumber", "dr", "52")
+
+        self.assertEqual(request.call_args.args[0]["maxPrice"], 0.15)
+
 
 class SmsProviderRankingTests(unittest.TestCase):
     def setUp(self):

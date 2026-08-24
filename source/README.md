@@ -302,11 +302,11 @@ WebUI「📱 接码配置」Tab 启用接码后，命中 add-phone 时会自动�
 | `sms_provider` | herosms / smsbower / sms_activate |
 | `sms_country` | 国家代码或 ID，默认 `52`（Thailand） |
 | `sms_service` | OpenAI = `dr` |
-| `sms_max_price` | 单号最高价格（HeroSMS / SmsBower 用，平台货币单位） |
+| `sms_max_price` | 单号硬性最高价格（HeroSMS / SmsBower 用）；项目级上限固定为 `0.15` |
 | `sms_reuse_phone` | 同号复用（HeroSMS / SmsBower） |
 | `sms_phone_success_max` | 同号最多复用 N 次 |
 | `sms_auto_country` | 自动选国家；HeroSMS 会读取全部可用国家价格 |
-| `sms_auto_max_price` | HeroSMS 优先价格阈值；阈值外候选仅作兜底 |
+| `sms_auto_max_price` | 自动选号优先价格阈值，最高 `0.15`；实际租号仍受硬上限保护 |
 
 
 ### Sentinel Token 深层校验

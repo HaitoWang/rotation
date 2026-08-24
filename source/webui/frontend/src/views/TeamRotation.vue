@@ -52,13 +52,6 @@ const stateMeta = computed(() => ({
   stopped: { label: '已停止', type: 'info' },
 }[status.value.state] || { label: status.value.state, type: 'info' }))
 
-const activeUsage = computed(() => {
-  const active = status.value.members.filter((item) => item.status === 'active')
-  if (!active.length) return 0
-  const values = active.map(usageOf).filter((value) => value !== null)
-  return values.length ? Math.round(values.reduce((sum, value) => sum + value, 0) / values.length) : 0
-})
-
 const memberFilterOptions = computed(() => [
   { value: 'all', label: '全部', count: status.value.members.length },
   { value: 'active', label: '使用中', count: status.value.members.filter((item) => item.status === 'active').length },
@@ -100,19 +93,12 @@ watch(() => detail.value.members.length, () => {
   if (detailPage.value > detailTotalPages.value) detailPage.value = detailTotalPages.value
 })
 
-function usageOf(row) {
-  const values = [row.primary_used_percent, row.secondary_used_percent]
-    .filter((value) => value !== null && value !== undefined)
-    .map(Number)
-  return values.length ? Math.max(...values) : null
-}
-
 function statusTag(value) {
   return {
     pending: ['待加入', 'warning'],
     auth_required: ['待人工重授权', 'warning'],
     active: ['使用中', 'success'],
-    exhausted: ['额度耗尽', 'danger'],
+    exhausted: ['限流移出', 'danger'],
     removed: ['已移出', 'info'],
     failed: ['加入失败', 'danger'],
   }[value] || [value || '-', 'info']
@@ -174,7 +160,7 @@ function resume() {
 }
 async function stop() {
   try {
-    await ElMessageBox.confirm('停止后不会继续检查额度或自动补位。', '停止 Team 轮转', {
+    await ElMessageBox.confirm('停止后不会继续检查 Hub 状态或自动补位。', '停止 Team 轮转', {
       type: 'warning', confirmButtonText: '停止', cancelButtonText: '取消',
     })
   } catch { return }
@@ -317,10 +303,10 @@ onBeforeUnmount(() => window.clearInterval(pollTimer))
       </template>
 
       <div class="control-grid">
-        <el-form-item class="control-field" label="子号额度检查间隔（秒）" label-position="top">
+        <el-form-item class="control-field" label="Hub 状态检查间隔（秒）" label-position="top">
           <el-input-number v-model="config.interval_seconds" :min="10" :max="86400" :step="30" controls-position="right" />
         </el-form-item>
-        <el-form-item class="control-field" label="额度并发数" label-position="top">
+        <el-form-item class="control-field" label="状态并发数" label-position="top">
           <el-input-number v-model="config.quota_concurrency" :min="1" :max="32" :step="1" controls-position="right" />
         </el-form-item>
         <el-form-item class="control-field" label="母号并发数" label-position="top">
@@ -344,7 +330,6 @@ onBeforeUnmount(() => window.clearInterval(pollTimer))
       <el-card class="stat-card"><div class="stat-value">{{ status.mothers.length }}</div><div class="stat-label">母号</div></el-card>
       <el-card class="stat-card"><div class="stat-value">{{ status.counts.active || 0 }}</div><div class="stat-label">使用中子号</div></el-card>
       <el-card class="stat-card"><div class="stat-value">{{ status.counts.exhausted || 0 }}</div><div class="stat-label">已轮出</div></el-card>
-      <el-card class="stat-card"><div class="stat-value">{{ activeUsage }}%</div><div class="stat-label">平均额度使用</div></el-card>
     </div>
 
     <el-card class="table-panel">
@@ -397,7 +382,7 @@ onBeforeUnmount(() => window.clearInterval(pollTimer))
         <div class="panel-header member-header">
           <div class="panel-title-group">
             <div class="title-line"><h2 class="section-title">轮转账号</h2><span class="header-count">{{ filteredMembers.length }} 条记录</span></div>
-            <p class="section-subtitle">实时查看子号状态、Hub 推送和额度使用情况</p>
+            <p class="section-subtitle">实时查看子号状态和 Hub 推送情况</p>
           </div>
           <el-radio-group v-model="memberFilter" size="small" class="member-filters">
             <el-radio-button v-for="item in memberFilterOptions" :key="item.value" :value="item.value">{{ item.label }} {{ item.count }}</el-radio-button>
@@ -415,15 +400,6 @@ onBeforeUnmount(() => window.clearInterval(pollTimer))
             <el-tooltip :disabled="!row.hub_error" :content="row.hub_error">
               <el-tag :type="hubStatusTag(row.hub_status)[1]" effect="light">{{ hubStatusTag(row.hub_status)[0] }}</el-tag>
             </el-tooltip>
-          </template>
-        </el-table-column>
-        <el-table-column label="额度" min-width="190">
-          <template #default="{ row }">
-            <div v-if="usageOf(row) !== null" class="usage-cell">
-              <el-progress :percentage="usageOf(row)" :stroke-width="7" :show-text="false" :status="usageOf(row) >= 100 ? 'exception' : ''" />
-              <span>{{ usageOf(row) }}%</span>
-            </div>
-            <span v-else>-</span>
           </template>
         </el-table-column>
         <el-table-column label="加入时间" width="170"><template #default="{ row }">{{ fmtTime(row.joined_at) }}</template></el-table-column>

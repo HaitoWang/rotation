@@ -272,6 +272,82 @@ class Sub2ApiHubPayloadTests(unittest.TestCase):
         self.assertEqual(url, "https://hub.example.com/api/v1/admin/groups/all?platform=openai")
         self.assertEqual(cffi.get.call_args.kwargs["headers"]["x-api-key"], "admin-key")
 
+    def test_account_status_classifies_rate_limit_from_hub(self):
+        response = mock.Mock(status_code=200)
+        response.json.return_value = {
+            "code": 0,
+            "data": {
+                "id": 101,
+                "status": "active",
+                "schedulable": True,
+                "rate_limit_reset_at": time.time() + 3600,
+            },
+        }
+        cffi = mock.Mock()
+        cffi.get.return_value = response
+
+        with mock.patch.object(exporter, "_import_cffi", return_value=cffi):
+            result = exporter.get_sub2api_account_status({
+                "sub2api_url": "https://hub.example.com",
+                "sub2api_api_key": "admin-key",
+            }, 101)
+
+        self.assertEqual(result["classification"], "rate_limited")
+        self.assertIn("/api/v1/admin/accounts/101", cffi.get.call_args.args[0])
+
+    def test_account_status_classifies_error_for_reauthorization(self):
+        response = mock.Mock(status_code=200)
+        response.json.return_value = {
+            "code": 0,
+            "data": {
+                "id": 101,
+                "status": "error",
+                "error_message": "access token expired",
+            },
+        }
+        cffi = mock.Mock()
+        cffi.get.return_value = response
+
+        with mock.patch.object(exporter, "_import_cffi", return_value=cffi):
+            result = exporter.get_sub2api_account_status({
+                "sub2api_url": "https://hub.example.com",
+                "sub2api_api_key": "admin-key",
+            }, "101")
+
+        self.assertEqual(result["classification"], "auth_required")
+        self.assertEqual(result["error"], "access token expired")
+
+    def test_admin_api_auth_failure_is_not_child_reauthorization(self):
+        response = mock.Mock(status_code=401)
+        response.json.return_value = {"message": "invalid admin key"}
+        cffi = mock.Mock()
+        cffi.get.return_value = response
+
+        with mock.patch.object(exporter, "_import_cffi", return_value=cffi):
+            result = exporter.get_sub2api_account_status({
+                "sub2api_url": "https://hub.example.com",
+                "sub2api_api_key": "admin-key",
+            }, 101)
+
+        self.assertEqual(result["classification"], "hub_error")
+
+    def test_disabled_hub_account_is_not_treated_as_auth_failure(self):
+        response = mock.Mock(status_code=200)
+        response.json.return_value = {
+            "code": 0,
+            "data": {"id": 101, "status": "active", "schedulable": False},
+        }
+        cffi = mock.Mock()
+        cffi.get.return_value = response
+
+        with mock.patch.object(exporter, "_import_cffi", return_value=cffi):
+            result = exporter.get_sub2api_account_status({
+                "sub2api_url": "https://hub.example.com",
+                "sub2api_api_key": "admin-key",
+            }, 101)
+
+        self.assertEqual(result["classification"], "inactive")
+
 
 class TeamRotationHubStateTests(unittest.TestCase):
     def setUp(self):
@@ -352,6 +428,54 @@ class TeamRotationHubStateTests(unittest.TestCase):
         self.assertEqual(updated["hub_status"], "success")
         self.assertIsNotNone(updated["hub_pushed_at"])
         self.assertEqual(updated["hub_error"], "")
+
+    def test_successful_hub_push_persists_account_id(self):
+        controller = TeamRotationController(service_factory=mock.Mock())
+        assignment = db.find_team_rotation_member(
+            self.mother["id"], "child@example.com"
+        )
+        with mock.patch.object(
+            exporter,
+            "run_exports",
+            return_value={"sub2api": {"ok": True, "account_id": "101"}},
+        ):
+            controller._push_assignment_to_hub(self.mother, assignment)
+
+        updated = db.find_team_rotation_member(
+            self.mother["id"], "child@example.com"
+        )
+        self.assertEqual(updated["hub_account_id"], "101")
+
+    def test_hub_rate_limited_member_is_removed_without_balance_probe(self):
+        assignment = db.find_team_rotation_member(
+            self.mother["id"], "child@example.com"
+        )
+        db.update_team_rotation_member(
+            assignment["id"], status="active", member_id="member-1",
+            hub_status="success", hub_account_id="101",
+        )
+        service = mock.Mock()
+        service.get_team_detail.return_value = {
+            "seats": {"entitled": 1, "in_use": 1, "remaining_default": 0},
+            "members": [{"id": "member-1", "email": "child@example.com"}],
+        }
+        service.remove_member.return_value = {"removed": True}
+        controller = TeamRotationController(
+            service_factory=mock.Mock(return_value=service)
+        )
+        with mock.patch.object(
+            exporter,
+            "get_sub2api_account_status",
+            return_value={"classification": "rate_limited", "error": "账号限流"},
+        ):
+            controller._process_mother(self.mother)
+
+        service.remove_member.assert_called_once_with(self.mother, "member-1")
+        service.check_quota.assert_not_called()
+        updated = db.find_team_rotation_member(
+            self.mother["id"], "child@example.com"
+        )
+        self.assertEqual(updated["status"], "exhausted")
 
     def test_reauthorized_hub_push_prefixes_display_name_only(self):
         controller = TeamRotationController(service_factory=mock.Mock())
@@ -635,43 +759,42 @@ class TeamRotationHubStateTests(unittest.TestCase):
         service.remove_member.return_value = {"removed": True}
         return service
 
-    def test_quota_401_reauthorizes_repushes_and_does_not_remove(self):
-        service = self._quota_service(
-            {
-                "status": "auth_required",
-                "http_status": 401,
-                "primary_used_percent": None,
-                "secondary_used_percent": None,
-                "error": "授权失效 (HTTP 401)",
-            },
-            {
-                "status": "alive",
-                "http_status": 200,
-                "primary_used_percent": 45.0,
-                "secondary_used_percent": 20.0,
-                "error": "",
-            },
+    def test_hub_status_error_reauthorizes_and_repushes(self):
+        assignment = db.find_team_rotation_member(
+            self.mother["id"], "child@example.com"
         )
+        db.update_team_rotation_member(
+            assignment["id"], hub_status="success", hub_account_id="101"
+        )
+        service = mock.Mock()
+        service.get_team_detail.return_value = {
+            "seats": {"entitled": 2, "in_use": 2, "remaining_default": 0},
+            "members": [{"id": "member-1", "email": "child@example.com"}],
+        }
         controller = TeamRotationController(service_factory=mock.Mock(return_value=service))
 
         def mark_hub_success(_mother, assignment, **_kwargs):
-            db.update_team_rotation_member(assignment["id"], hub_status="success", hub_error="")
+            db.update_team_rotation_member(
+                assignment["id"], hub_status="success", hub_error="", hub_account_id="102"
+            )
 
         with mock.patch(
             "webui.registrar.reauthorize_registered_account",
             return_value={"ok": True, "account": db.get_registered("child@example.com")},
         ) as reauthorize, mock.patch.object(
             controller, "_push_assignment_to_hub", side_effect=mark_hub_success
-        ) as push:
+        ) as push, mock.patch.object(
+            exporter,
+            "get_sub2api_account_status",
+            return_value={"classification": "auth_required", "error": "access token expired"},
+        ):
             controller._process_mother(self.mother)
 
         reauthorize.assert_called_once()
         push.assert_called_once()
         service.remove_member.assert_not_called()
-        self.assertEqual(service.check_quota.call_count, 2)
         updated = db.find_team_rotation_member(self.mother["id"], "child@example.com")
         self.assertEqual(updated["status"], "active")
-        self.assertEqual(updated["primary_used_percent"], 45.0)
         self.assertEqual(updated["hub_status"], "success")
 
     def test_invalid_hub_refresh_token_reauthorizes_and_retries_once(self):
@@ -743,47 +866,7 @@ class TeamRotationHubStateTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertTrue(observed["want_refresh_token"])
 
-    def test_member_is_removed_only_after_two_consecutive_100_percent_checks(self):
-        result = {
-            "status": "alive",
-            "http_status": 200,
-            "primary_used_percent": 100.0,
-            "secondary_used_percent": 40.0,
-            "error": "",
-        }
-        service = self._quota_service(result, result)
-        db.update_team_rotation_member(self.assignment["id"], hub_status="success")
-        controller = TeamRotationController(service_factory=mock.Mock(return_value=service))
-        controller._process_mother(self.mother)
-
-        service.remove_member.assert_not_called()
-        updated = db.find_team_rotation_member(self.mother["id"], "child@example.com")
-        self.assertEqual(updated["status"], "active")
-        self.assertEqual(updated["error"], "额度达到 100%，等待下一轮复核")
-
-        controller._process_mother(self.mother)
-        service.remove_member.assert_called_once_with(self.mother, "member-1")
-        updated = db.find_team_rotation_member(self.mother["id"], "child@example.com")
-        self.assertEqual(updated["status"], "exhausted")
-
-    def test_member_is_not_removed_below_100_percent(self):
-        service = self._quota_service({
-            "status": "alive",
-            "http_status": 200,
-            "primary_used_percent": 99.9,
-            "secondary_used_percent": 99.0,
-            "error": "",
-        })
-        db.update_team_rotation_member(self.assignment["id"], hub_status="success")
-        controller = TeamRotationController(service_factory=mock.Mock(return_value=service))
-        controller._process_mother(self.mother)
-
-        service.remove_member.assert_not_called()
-        updated = db.find_team_rotation_member(self.mother["id"], "child@example.com")
-        self.assertEqual(updated["status"], "active")
-        self.assertEqual(updated["primary_used_percent"], 99.9)
-
-    def test_periodic_quota_check_with_no_seat_skips_team_detail_api(self):
+    def test_periodic_hub_status_check_with_no_seat_skips_team_detail_api(self):
         db.record_team_mother_check(
             self.mother["id"],
             entitled=2,
@@ -793,20 +876,13 @@ class TeamRotationHubStateTests(unittest.TestCase):
         db.update_team_rotation_member(self.assignment["id"], hub_status="success")
         mother = db.get_team_mother(self.mother["id"], include_secret=True)
         service = mock.Mock()
-        service.check_quota.return_value = {
-            "status": "alive",
-            "http_status": 200,
-            "primary_used_percent": 42.0,
-            "secondary_used_percent": 10.0,
-            "error": "",
-        }
         controller = TeamRotationController(service_factory=mock.Mock(return_value=service))
 
         controller._process_mother(mother, force_team_refresh=False)
 
         service.get_team_detail.assert_not_called()
         service.invite_and_accept.assert_not_called()
-        service.check_quota.assert_called_once()
+        service.check_quota.assert_not_called()
 
     def test_quota_concurrency_is_persisted_in_rotation_options(self):
         controller = TeamRotationController(service_factory=mock.Mock())
@@ -819,7 +895,7 @@ class TeamRotationHubStateTests(unittest.TestCase):
         self.assertEqual(saved["quota_concurrency"], 12)
         self.assertEqual(db.get_setting("team_rotation_quota_concurrency"), "12")
 
-    def test_active_member_quota_checks_overlap(self):
+    def test_active_member_hub_status_checks_overlap(self):
         emails = ["child-2@example.com", "child-3@example.com"]
         now = time.time()
         for index, email in enumerate(emails, start=2):
@@ -833,43 +909,34 @@ class TeamRotationHubStateTests(unittest.TestCase):
         for index, email in enumerate(emails, start=2):
             con.execute(
                 "INSERT INTO team_rotation_members "
-                "(mother_id, email, member_id, status, hub_status, created_at, updated_at) "
-                "VALUES (?, ?, ?, 'active', 'success', ?, ?)",
-                (self.mother["id"], email, f"member-{index}", now, now),
+                "(mother_id, email, member_id, status, hub_status, hub_account_id, created_at, updated_at) "
+                "VALUES (?, ?, ?, 'active', 'success', ?, ?, ?)",
+                (self.mother["id"], email, f"member-{index}", str(100 + index), now, now),
             )
         con.commit()
         db.record_team_mother_check(
             self.mother["id"], entitled=3, in_use=3, remaining=0
+        )
+        db.update_team_rotation_member(
+            self.assignment["id"], hub_status="success", hub_account_id="101"
         )
 
         barrier = threading.Barrier(3)
         lock = threading.Lock()
         observed = {"active": 0, "max_active": 0}
 
-        class ConcurrentService:
-            def check_quota(self, _account, _workspace):
+        def check_status(_cfg, account_id):
+            with lock:
+                observed["active"] += 1
+                observed["max_active"] = max(observed["max_active"], observed["active"])
+            try:
+                barrier.wait(timeout=3)
+            finally:
                 with lock:
-                    observed["active"] += 1
-                    observed["max_active"] = max(observed["max_active"], observed["active"])
-                try:
-                    barrier.wait(timeout=3)
-                finally:
-                    with lock:
-                        observed["active"] -= 1
-                return {
-                    "status": "alive",
-                    "http_status": 200,
-                    "primary_used_percent": 20.0,
-                    "secondary_used_percent": 10.0,
-                    "error": "",
-                }
+                    observed["active"] -= 1
+            return {"classification": "healthy", "error": ""}
 
-            def close(self):
-                return None
-
-        controller = TeamRotationController(
-            service_factory=mock.Mock(side_effect=lambda _proxy: ConcurrentService())
-        )
+        controller = TeamRotationController(service_factory=mock.Mock())
         controller._save_options({
             "interval_seconds": 60,
             "quota_concurrency": 3,
@@ -877,10 +944,11 @@ class TeamRotationHubStateTests(unittest.TestCase):
             "proxy": "",
         })
 
-        controller._process_mother(
-            db.get_team_mother(self.mother["id"], include_secret=True),
-            force_team_refresh=False,
-        )
+        with mock.patch.object(exporter, "get_sub2api_account_status", side_effect=check_status):
+            controller._process_mother(
+                db.get_team_mother(self.mother["id"], include_secret=True),
+                force_team_refresh=False,
+            )
 
         self.assertEqual(observed["max_active"], 3)
 

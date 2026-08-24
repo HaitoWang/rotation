@@ -11,6 +11,7 @@ import asyncio
 import base64
 import json
 import logging
+import math
 import sqlite3
 import sys
 import time
@@ -660,6 +661,23 @@ class SaveSmsConfigReq(BaseModel):
 @app.post("/api/settings/sms")
 def api_save_sms_config(req: SaveSmsConfigReq):
     data = req.model_dump(exclude_none=True)
+    max_allowed_price = 0.15
+    for key, label in (
+        ("sms_max_price", "号码硬性最高单价"),
+        ("sms_auto_max_price", "自动选号价格阈值"),
+    ):
+        if key not in data:
+            continue
+        raw_price = str(data.get(key) or "").strip()
+        try:
+            price = float(raw_price) if raw_price else max_allowed_price
+        except ValueError as exc:
+            raise HTTPException(400, f"{label}必须是数字") from exc
+        if not math.isfinite(price):
+            raise HTTPException(400, f"{label}必须是有限数字")
+        if price <= 0:
+            price = max_allowed_price
+        data[key] = f"{min(price, max_allowed_price):g}"
     raw_attempts = str(data.get("sms_max_phone_attempts") or "").strip()
     if raw_attempts:
         try:

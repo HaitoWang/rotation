@@ -1116,101 +1116,135 @@ class TeamRotationController:
                 status="active",
                 limit=5000,
             )
+            try:
+                export_cfg = db.get_export_internal_config().get("sub2api", {})
+            except Exception as exc:
+                export_cfg = {}
+                self._event("ERROR", "hub", f"读取 Sub2API 配置失败: {exc}", mother_id)
+            hub_enabled = bool(export_cfg.get("enabled"))
 
-            def check_assignment(assignment: dict) -> tuple[dict, Optional[dict], Optional[dict]]:
+            def check_assignment(assignment: dict) -> tuple[dict, Optional[dict], dict]:
                 account = db.get_registered(assignment["email"])
                 if not account:
-                    return assignment, None, None
-                quota_service = service
+                    return assignment, None, {
+                        "classification": "error",
+                        "error": "本地凭证不存在，无法检查 Sub2API 状态",
+                    }
+                if not hub_enabled:
+                    return assignment, account, {
+                        "classification": "disabled",
+                        "error": "Sub2API 未启用，跳过账号状态检查",
+                    }
+                hub_account_id = str(assignment.get("hub_account_id") or "").strip()
+                if not hub_account_id:
+                    return assignment, account, {
+                        "classification": "missing",
+                        "error": "缺少 Sub2API account_id，等待重新推送",
+                    }
                 try:
-                    # Use a client per worker. curl/request sessions are not
-                    # shared across concurrent requests in production.
-                    if len(active_members) > 1:
-                        quota_service = self._service_factory(self._options.get("proxy", ""))
-                    quota = quota_service.check_quota(account, mother["workspace_id"])
+                    from . import exporter
+
+                    return assignment, account, exporter.get_sub2api_account_status(
+                        export_cfg, hub_account_id
+                    )
                 except Exception as exc:
-                    quota = {
-                        "status": "unknown",
-                        "http_status": None,
-                        "primary_used_percent": None,
-                        "secondary_used_percent": None,
+                    return assignment, account, {
+                        "classification": "hub_error",
                         "error": str(exc)[:1000],
                     }
-                finally:
-                    if quota_service is not service:
-                        try:
-                            quota_service.close()
-                        except Exception:
-                            pass
-                return assignment, account, quota
 
-            # Token refresh and quota requests are independent per child. Keep
-            # Team mutations below ordered, but overlap the network-bound checks.
-            quota_workers = min(
+            # 只轮询 Sub2API 账号状态，不再调用 ChatGPT /wham/usage 余额探针。
+            status_workers = min(
                 max(1, int(self._options.get("quota_concurrency") or 8)),
                 len(active_members),
             )
-            if quota_workers > 1:
+            if status_workers > 1:
                 with ThreadPoolExecutor(
-                    max_workers=quota_workers,
-                    thread_name_prefix="team-quota",
+                    max_workers=status_workers,
+                    thread_name_prefix="team-hub-status",
                 ) as executor:
-                    quota_results = list(executor.map(check_assignment, active_members))
+                    status_results = list(executor.map(check_assignment, active_members))
             else:
-                quota_results = [check_assignment(assignment) for assignment in active_members]
+                status_results = [check_assignment(assignment) for assignment in active_members]
 
-            for assignment, account, quota in quota_results:
+            hub_reauthorized_ids: set[int] = set()
+            for assignment, account, hub_status in status_results:
                 if self._stop_event.is_set() or self._pause_event.is_set():
                     break
+                # 余额探针已停用，清理历史百分比，避免 UI 继续展示过期数据。
+                db.update_team_rotation_member(
+                    assignment["id"],
+                    primary_used_percent=None,
+                    secondary_used_percent=None,
+                )
                 if account is None:
                     db.update_team_rotation_member(
                         assignment["id"],
                         last_checked_at=time.time(),
-                        error="本地凭证不存在，无法检查额度",
+                        error=hub_status.get("error") or "本地凭证不存在",
                     )
                     continue
-                if quota.get("status") == "auth_required":
+                classification = str(hub_status.get("classification") or "hub_error")
+                checked_at = time.time()
+                if classification == "rate_limited":
                     db.update_team_rotation_member(
                         assignment["id"],
-                        last_checked_at=time.time(),
-                        error=quota.get("error") or "授权失效",
+                        last_checked_at=checked_at,
+                        error=hub_status.get("error") or "Sub2API 账号限流",
+                    )
+                    self._remove_assignment(
+                        service,
+                        mother,
+                        assignment,
+                        hub_status.get("error") or "Sub2API 账号限流，移出 Team",
+                        "exhausted",
+                    )
+                    removed_count += 1
+                    continue
+
+                if classification == "inactive":
+                    db.update_team_rotation_member(
+                        assignment["id"],
+                        last_checked_at=checked_at,
+                        error=hub_status.get("error") or "Sub2API 账号当前不可调度",
+                    )
+                    continue
+
+                if classification in {"auth_required", "error"}:
+                    error = hub_status.get("error") or "Sub2API 账号状态异常"
+                    db.update_team_rotation_member(
+                        assignment["id"], last_checked_at=checked_at, error=error
                     )
                     if not self._reauthorize_assignment(mother, assignment):
                         continue
-                    account = db.get_registered(assignment["email"])
-                    if not account:
-                        continue
-                    quota = service.check_quota(account, mother["workspace_id"])
-                checked_at = time.time()
-                primary = quota.get("primary_used_percent")
-                secondary = quota.get("secondary_used_percent")
+                    hub_reauthorized_ids.add(int(assignment["id"]))
+                    continue
+
+                if classification == "missing":
+                    db.update_team_rotation_member(
+                        assignment["id"],
+                        hub_status="pending",
+                        hub_account_id=None,
+                        hub_error=hub_status.get("error") or "Sub2API 账号不存在",
+                        last_checked_at=checked_at,
+                        error=hub_status.get("error") or "等待重新推送 Sub2API",
+                    )
+                    continue
+
+                if classification == "hub_error":
+                    db.update_team_rotation_member(
+                        assignment["id"],
+                        last_checked_at=checked_at,
+                        hub_error=hub_status.get("error") or "Sub2API 状态查询失败",
+                    )
+                    continue
+
                 db.update_team_rotation_member(
                     assignment["id"],
-                    primary_used_percent=primary,
-                    secondary_used_percent=secondary,
                     last_checked_at=checked_at,
-                    error=quota.get("error") or "",
+                    error="",
+                    hub_error="",
                 )
-                values = [value for value in (primary, secondary) if value is not None]
-                exhausted = bool(values and max(values) >= 100.0)
-                if exhausted:
-                    reason = f"额度达到 {max(values):g}%"
-                    confirmed = assignment.get("error") == "额度达到 100%，等待下一轮复核"
-                    if not confirmed:
-                        db.update_team_rotation_member(
-                            assignment["id"],
-                            error="额度达到 100%，等待下一轮复核",
-                        )
-                        self._event(
-                            "WARNING",
-                            "quota",
-                            "额度首次达到 100%，等待下一轮复核",
-                            mother_id,
-                            assignment["email"],
-                        )
-                        continue
-                    self._remove_assignment(service, mother, assignment, reason, "exhausted")
-                    removed_count += 1
 
             if removed_count:
                 seats["remaining_default"] = int(seats.get("remaining_default") or 0) + removed_count
@@ -1308,7 +1342,9 @@ class TeamRotationController:
             ):
                 if self._stop_event.is_set() or self._pause_event.is_set():
                     break
-                if assignment.get("hub_status") == "success":
+                if int(assignment["id"]) in hub_reauthorized_ids:
+                    continue
+                if assignment.get("hub_status") == "success" and assignment.get("hub_account_id"):
                     continue
                 if assignment.get("hub_status") == "failed":
                     retry_delay = max(60, int(self._options.get("interval_seconds") or 300))
@@ -1348,7 +1384,7 @@ class TeamRotationController:
         repush_hub: bool = True,
     ) -> bool:
         email = str(assignment.get("email") or "").strip().lower()
-        self._event("WARNING", "auth", "额度检查返回 401，开始重新授权", mother["id"], email)
+        self._event("WARNING", "auth", "Sub2API 账号状态异常，开始重新授权", mother["id"], email)
         try:
             from . import registrar
 
@@ -1370,6 +1406,7 @@ class TeamRotationController:
             error="",
             hub_status="pending",
             hub_error="",
+            hub_account_id=None,
         )
         self._event("INFO", "auth", "重新授权成功，重新推送 Hub", mother["id"], email)
         if repush_hub:
@@ -1413,6 +1450,7 @@ class TeamRotationController:
         db.update_team_rotation_member(
             assignment["id"],
             hub_last_attempt_at=time.time(),
+            hub_account_id=None,
         )
 
         try:
@@ -1453,14 +1491,24 @@ class TeamRotationController:
             result = {"ok": False, "error": str(exc)}
 
         if result.get("ok"):
+            hub_account_id = str(result.get("account_id") or "").strip()
+            if not hub_account_id:
+                error = "Sub2API 推送成功但响应缺少账号 ID"
+                db.update_team_rotation_member(
+                    assignment["id"], hub_status="failed", hub_error=error
+                )
+                self._event("ERROR", "hub", error, mother["id"], assignment["email"])
+                return
             db.update_team_rotation_member(
                 assignment["id"],
                 hub_status="success",
                 hub_pushed_at=time.time(),
                 hub_error="",
+                hub_account_id=hub_account_id,
             )
             self._event(
-                "INFO", "hub", "子号已推送到 Hub", mother["id"], assignment["email"]
+                "INFO", "hub", f"子号已推送到 Hub (account_id={hub_account_id})",
+                mother["id"], assignment["email"]
             )
         else:
             error = str(result.get("error") or "Hub 推送失败")[:1000]
