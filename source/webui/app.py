@@ -1312,6 +1312,8 @@ class TeamMotherUpdateReq(BaseModel):
 class TeamRotationStartReq(BaseModel):
     interval_seconds: int = Field(300, ge=10, le=86400)
     quota_threshold: float = Field(100, ge=1, le=100)
+    quota_concurrency: int = Field(8, ge=1, le=32)
+    mother_concurrency: int = Field(2, ge=1, le=16)
     proxy: str = Field("", max_length=4096)
 
 

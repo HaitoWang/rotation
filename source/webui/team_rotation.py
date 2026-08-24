@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+from concurrent.futures import ThreadPoolExecutor
 import json
 import logging
 import os
@@ -21,6 +22,17 @@ from . import db
 
 logger = logging.getLogger("team_rotation")
 BASE_URL = os.getenv("CHATGPT_BASE_URL", "https://chatgpt.com").rstrip("/")
+
+_CODEX_TOKEN_CACHE_LOCK = threading.RLock()
+_CODEX_TOKEN_CACHE: dict[str, dict[str, Any]] = {}
+_CODEX_TOKEN_LOCKS: dict[str, threading.Lock] = {}
+_CODEX_TOKEN_CACHE_TTL = 300.0
+
+
+def _codex_token_lock(email: str) -> threading.Lock:
+    key = str(email or "").strip().lower()
+    with _CODEX_TOKEN_CACHE_LOCK:
+        return _CODEX_TOKEN_LOCKS.setdefault(key, threading.Lock())
 
 
 class TeamApiError(RuntimeError):
@@ -419,6 +431,71 @@ class TeamService:
         credentials.apply_token_identity()
 
     @staticmethod
+    def _invalidate_codex_token_cache(email: str) -> None:
+        key = str(email or "").strip().lower()
+        if not key:
+            return
+        with _CODEX_TOKEN_CACHE_LOCK:
+            _CODEX_TOKEN_CACHE.pop(key, None)
+
+    def _get_codex_token(self, account: dict) -> dict:
+        """Reuse a short-lived Codex token so every quota poll does not refresh OAuth."""
+        email = str(account.get("email") or "").strip().lower()
+        refresh_token = str(account.get("refresh_token") or "").strip()
+        if not refresh_token:
+            raise TeamApiError("缺少 Codex Refresh Token，无法检查 Team 额度")
+        now = time.time()
+        with _CODEX_TOKEN_CACHE_LOCK:
+            cached = _CODEX_TOKEN_CACHE.get(email)
+            if (
+                cached
+                and cached.get("source_refresh_token", cached.get("refresh_token")) == refresh_token
+                and float(cached.get("expires_at") or 0) > now
+            ):
+                return dict(cached)
+
+        token_lock = _codex_token_lock(email)
+        with token_lock:
+            with _CODEX_TOKEN_CACHE_LOCK:
+                cached = _CODEX_TOKEN_CACHE.get(email)
+                if (
+                    cached
+                    and cached.get("source_refresh_token", cached.get("refresh_token")) == refresh_token
+                    and float(cached.get("expires_at") or 0) > time.time()
+                ):
+                    return dict(cached)
+            from . import exporter
+
+            fresh = exporter.refresh_codex_token(refresh_token)
+            rotated_refresh = str(
+                fresh.get("refresh_token") or refresh_token
+            ).strip()
+            if not db.update_registered_codex_tokens(
+                email,
+                refresh_token=rotated_refresh,
+                id_token=fresh.get("id_token") or "",
+            ):
+                raise RuntimeError("滚动后的 Codex Token 写回账号池失败")
+            access_token = str(fresh.get("access_token") or "").strip()
+            if not access_token:
+                raise RuntimeError("Codex Token 刷新响应缺少 access_token")
+            try:
+                expires_in = float(fresh.get("expires_in") or 3600)
+            except (TypeError, ValueError):
+                expires_in = 3600.0
+            cache_ttl = min(_CODEX_TOKEN_CACHE_TTL, max(30.0, expires_in - 60.0))
+            result = {
+                "access_token": access_token,
+                "source_refresh_token": refresh_token,
+                "refresh_token": rotated_refresh,
+                "id_token": str(fresh.get("id_token") or "").strip(),
+                "expires_at": time.time() + cache_ttl,
+            }
+            with _CODEX_TOKEN_CACHE_LOCK:
+                _CODEX_TOKEN_CACHE[email] = result
+            return dict(result)
+
+    @staticmethod
     def _require(status: int, payload: Any, action: str, allow_404: bool = False) -> None:
         if allow_404 and status == 404:
             return
@@ -590,8 +667,7 @@ class TeamService:
         # Web Session Token may remain bound to the previous Team after recycling;
         # use the same Codex OAuth refresh path as Hub before reading usage.
         credentials = self._credentials_from_registered(account)
-        refresh_token = str(account.get("refresh_token") or "").strip()
-        if not refresh_token:
+        if not str(account.get("refresh_token") or "").strip():
             return {
                 "status": "auth_required",
                 "http_status": None,
@@ -600,23 +676,13 @@ class TeamService:
                 "error": "缺少 Codex Refresh Token，无法检查 Team 额度",
             }
         try:
-            from . import exporter
-
-            fresh = exporter.refresh_codex_token(refresh_token)
-            rotated_refresh = str(
-                fresh.get("refresh_token") or refresh_token
-            ).strip()
-            if not db.update_registered_codex_tokens(
-                account.get("email") or "",
-                refresh_token=rotated_refresh,
-                id_token=fresh.get("id_token") or "",
-            ):
-                raise RuntimeError("滚动后的 Codex Token 写回账号池失败")
-            credentials.access_token = str(fresh.get("access_token") or "").strip()
+            fresh = self._get_codex_token(account)
+            credentials.access_token = fresh["access_token"]
             credentials.cookie_header = ""
             credentials.account_id = str(workspace_id or "").strip()
         except Exception as exc:
             error = str(exc)
+            self._invalidate_codex_token_cache(account.get("email") or "")
             auth_invalid = any(marker in error.lower() for marker in (
                 "refresh_token_invalidated",
                 "session has ended",
@@ -637,6 +703,7 @@ class TeamService:
             retries=2,
         )
         if status == 401:
+            self._invalidate_codex_token_cache(account.get("email") or "")
             return {
                 "status": "auth_required",
                 "http_status": status,
@@ -720,21 +787,37 @@ class TeamRotationController:
             interval = max(10, int(float(db.get_setting("team_rotation_interval_seconds", "300"))))
         except (TypeError, ValueError):
             interval = 300
+        try:
+            quota_concurrency = max(1, min(32, int(float(db.get_setting("team_rotation_quota_concurrency", "8")))))
+        except (TypeError, ValueError):
+            quota_concurrency = 8
+        try:
+            mother_concurrency = max(1, min(16, int(float(db.get_setting("team_rotation_mother_concurrency", "2")))))
+        except (TypeError, ValueError):
+            mother_concurrency = 2
         return {
             "interval_seconds": interval,
             "quota_threshold": 100.0,
+            "quota_concurrency": quota_concurrency,
+            "mother_concurrency": mother_concurrency,
             "proxy": db.get_setting("team_rotation_proxy", ""),
         }
 
     def _save_options(self, options: dict) -> dict:
         interval = max(10, int(options.get("interval_seconds") or 300))
+        quota_concurrency = max(1, min(32, int(options.get("quota_concurrency") or 8)))
+        mother_concurrency = max(1, min(16, int(options.get("mother_concurrency") or 2)))
         proxy = str(options.get("proxy") or "").strip()
         db.set_setting("team_rotation_interval_seconds", interval)
         db.set_setting("team_rotation_threshold", 100)
+        db.set_setting("team_rotation_quota_concurrency", quota_concurrency)
+        db.set_setting("team_rotation_mother_concurrency", mother_concurrency)
         db.set_setting("team_rotation_proxy", proxy)
         self._options = {
             "interval_seconds": interval,
             "quota_threshold": 100.0,
+            "quota_concurrency": quota_concurrency,
+            "mother_concurrency": mother_concurrency,
             "proxy": proxy,
         }
         return dict(self._options)
@@ -926,12 +1009,10 @@ class TeamRotationController:
             len(mothers),
             force_team_refresh,
         )
-        for mother in mothers:
+        def process_mother(mother: dict) -> None:
             if self._stop_event.is_set() or self._pause_event.is_set():
-                break
+                return
             mother_id = mother["id"]
-            with self._lock:
-                self._current_mother = mother.get("name") or mother_id
             try:
                 with self._mother_lock(mother_id):
                     self._process_mother(
@@ -944,6 +1025,26 @@ class TeamRotationController:
                 self._event("ERROR", "mother", message, mother_id)
                 with self._lock:
                     self._last_error = message
+
+        mother_workers = min(
+            max(1, int(self._options.get("mother_concurrency") or 2)),
+            len(mothers),
+        )
+        with self._lock:
+            self._current_mother = (
+                mothers[0].get("name") or mothers[0]["id"]
+                if mother_workers == 1 and mothers
+                else f"并行处理 {len(mothers)} 个母号"
+            )
+        if mother_workers > 1:
+            with ThreadPoolExecutor(
+                max_workers=mother_workers,
+                thread_name_prefix="team-mother",
+            ) as executor:
+                list(executor.map(process_mother, mothers))
+        else:
+            for mother in mothers:
+                process_mother(mother)
         with self._lock:
             self._current_mother = ""
 
@@ -1010,19 +1111,64 @@ class TeamRotationController:
                 refresh_team_detail()
 
             removed_count = 0
-            active_members = db.list_team_rotation_members(mother_id=mother_id, status="active", limit=5000)
-            for assignment in active_members:
-                if self._stop_event.is_set() or self._pause_event.is_set():
-                    break
+            active_members = db.list_team_rotation_members(
+                mother_id=mother_id,
+                status="active",
+                limit=5000,
+            )
+
+            def check_assignment(assignment: dict) -> tuple[dict, Optional[dict], Optional[dict]]:
                 account = db.get_registered(assignment["email"])
                 if not account:
+                    return assignment, None, None
+                quota_service = service
+                try:
+                    # Use a client per worker. curl/request sessions are not
+                    # shared across concurrent requests in production.
+                    if len(active_members) > 1:
+                        quota_service = self._service_factory(self._options.get("proxy", ""))
+                    quota = quota_service.check_quota(account, mother["workspace_id"])
+                except Exception as exc:
+                    quota = {
+                        "status": "unknown",
+                        "http_status": None,
+                        "primary_used_percent": None,
+                        "secondary_used_percent": None,
+                        "error": str(exc)[:1000],
+                    }
+                finally:
+                    if quota_service is not service:
+                        try:
+                            quota_service.close()
+                        except Exception:
+                            pass
+                return assignment, account, quota
+
+            # Token refresh and quota requests are independent per child. Keep
+            # Team mutations below ordered, but overlap the network-bound checks.
+            quota_workers = min(
+                max(1, int(self._options.get("quota_concurrency") or 8)),
+                len(active_members),
+            )
+            if quota_workers > 1:
+                with ThreadPoolExecutor(
+                    max_workers=quota_workers,
+                    thread_name_prefix="team-quota",
+                ) as executor:
+                    quota_results = list(executor.map(check_assignment, active_members))
+            else:
+                quota_results = [check_assignment(assignment) for assignment in active_members]
+
+            for assignment, account, quota in quota_results:
+                if self._stop_event.is_set() or self._pause_event.is_set():
+                    break
+                if account is None:
                     db.update_team_rotation_member(
                         assignment["id"],
                         last_checked_at=time.time(),
                         error="本地凭证不存在，无法检查额度",
                     )
                     continue
-                quota = service.check_quota(account, mother["workspace_id"])
                 if quota.get("status") == "auth_required":
                     db.update_team_rotation_member(
                         assignment["id"],

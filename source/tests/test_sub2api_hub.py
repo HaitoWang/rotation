@@ -1,6 +1,8 @@
 import base64
 import json
+import threading
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -273,6 +275,7 @@ class Sub2ApiHubPayloadTests(unittest.TestCase):
 
 class TeamRotationHubStateTests(unittest.TestCase):
     def setUp(self):
+        TeamService._invalidate_codex_token_cache("child@example.com")
         self.temp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.path_patch = mock.patch.object(
             db, "DB_PATH", Path(self.temp_dir.name) / "webui.db"
@@ -601,9 +604,14 @@ class TeamRotationHubStateTests(unittest.TestCase):
                     db.get_registered("child@example.com"),
                     "team-workspace",
                 )
+                second = service.check_quota(
+                    db.get_registered("child@example.com"),
+                    "team-workspace",
+                )
 
             self.assertEqual(result["status"], "alive")
             self.assertEqual(result["primary_used_percent"], 37.0)
+            self.assertEqual(second["status"], "alive")
             refresh.assert_called_once_with("refresh-token")
             update.assert_called_once_with(
                 "child@example.com",
@@ -799,6 +807,82 @@ class TeamRotationHubStateTests(unittest.TestCase):
         service.get_team_detail.assert_not_called()
         service.invite_and_accept.assert_not_called()
         service.check_quota.assert_called_once()
+
+    def test_quota_concurrency_is_persisted_in_rotation_options(self):
+        controller = TeamRotationController(service_factory=mock.Mock())
+        saved = controller._save_options({
+            "interval_seconds": 60,
+            "quota_threshold": 100,
+            "quota_concurrency": 12,
+            "proxy": "",
+        })
+        self.assertEqual(saved["quota_concurrency"], 12)
+        self.assertEqual(db.get_setting("team_rotation_quota_concurrency"), "12")
+
+    def test_active_member_quota_checks_overlap(self):
+        emails = ["child-2@example.com", "child-3@example.com"]
+        now = time.time()
+        for index, email in enumerate(emails, start=2):
+            db.save_registered({
+                "email": email,
+                "access_token": f"web-access-{index}",
+                "session_token": f"session-{index}",
+                "refresh_token": f"refresh-{index}",
+            })
+        con = db._conn()
+        for index, email in enumerate(emails, start=2):
+            con.execute(
+                "INSERT INTO team_rotation_members "
+                "(mother_id, email, member_id, status, hub_status, created_at, updated_at) "
+                "VALUES (?, ?, ?, 'active', 'success', ?, ?)",
+                (self.mother["id"], email, f"member-{index}", now, now),
+            )
+        con.commit()
+        db.record_team_mother_check(
+            self.mother["id"], entitled=3, in_use=3, remaining=0
+        )
+
+        barrier = threading.Barrier(3)
+        lock = threading.Lock()
+        observed = {"active": 0, "max_active": 0}
+
+        class ConcurrentService:
+            def check_quota(self, _account, _workspace):
+                with lock:
+                    observed["active"] += 1
+                    observed["max_active"] = max(observed["max_active"], observed["active"])
+                try:
+                    barrier.wait(timeout=3)
+                finally:
+                    with lock:
+                        observed["active"] -= 1
+                return {
+                    "status": "alive",
+                    "http_status": 200,
+                    "primary_used_percent": 20.0,
+                    "secondary_used_percent": 10.0,
+                    "error": "",
+                }
+
+            def close(self):
+                return None
+
+        controller = TeamRotationController(
+            service_factory=mock.Mock(side_effect=lambda _proxy: ConcurrentService())
+        )
+        controller._save_options({
+            "interval_seconds": 60,
+            "quota_concurrency": 3,
+            "mother_concurrency": 1,
+            "proxy": "",
+        })
+
+        controller._process_mother(
+            db.get_team_mother(self.mother["id"], include_secret=True),
+            force_team_refresh=False,
+        )
+
+        self.assertEqual(observed["max_active"], 3)
 
 
 if __name__ == "__main__":

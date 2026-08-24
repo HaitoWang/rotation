@@ -24,13 +24,13 @@ const loading = ref(false)
 const actionLoading = ref('')
 const status = ref({
   state: 'stopped',
-  config: { interval_seconds: 300, quota_threshold: 100, proxy: '' },
+  config: { interval_seconds: 300, quota_threshold: 100, quota_concurrency: 8, mother_concurrency: 2, proxy: '' },
   counts: {},
   mothers: [],
   members: [],
   events: [],
 })
-const config = reactive({ interval_seconds: 300, quota_threshold: 100, proxy: '' })
+const config = reactive({ interval_seconds: 300, quota_threshold: 100, quota_concurrency: 8, mother_concurrency: 2, proxy: '' })
 const configHydrated = ref(false)
 let pollTimer = 0
 
@@ -320,6 +320,12 @@ onBeforeUnmount(() => window.clearInterval(pollTimer))
         <el-form-item class="control-field" label="子号额度检查间隔（秒）" label-position="top">
           <el-input-number v-model="config.interval_seconds" :min="10" :max="86400" :step="30" controls-position="right" />
         </el-form-item>
+        <el-form-item class="control-field" label="额度并发数" label-position="top">
+          <el-input-number v-model="config.quota_concurrency" :min="1" :max="32" :step="1" controls-position="right" />
+        </el-form-item>
+        <el-form-item class="control-field" label="母号并发数" label-position="top">
+          <el-input-number v-model="config.mother_concurrency" :min="1" :max="16" :step="1" controls-position="right" />
+        </el-form-item>
         <el-form-item class="control-field" label="Team 请求代理" label-position="top">
           <el-input v-model="config.proxy" clearable placeholder="留空直连" />
         </el-form-item>
@@ -495,7 +501,7 @@ onBeforeUnmount(() => window.clearInterval(pollTimer))
 .table-footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding-top: 14px; }
 .table-hint { color: var(--el-text-color-secondary); font-size: 12px; font-variant-numeric: tabular-nums; }
 .detail-footer { margin-top: 12px; }
-.control-grid { display: grid; grid-template-columns: 190px 190px minmax(260px, 1fr); gap: 0 16px; align-items: end; }
+.control-grid { display: grid; grid-template-columns: 190px 140px 140px minmax(260px, 1fr); gap: 0 16px; align-items: end; }
 .control-grid :deep(.el-form-item) { margin-bottom: 12px; }
 .control-grid :deep(.control-field) { display: block; }
 .control-grid :deep(.control-field .el-form-item__label) { display: block; width: auto; height: auto; padding: 0 0 7px; line-height: 18px; }
@@ -523,12 +529,12 @@ onBeforeUnmount(() => window.clearInterval(pollTimer))
 .detail-summary strong { margin-left: 5px; color: var(--app-title); font-size: 16px; }
 @media (max-width: 1050px) {
   .control-grid { grid-template-columns: 1fr 1fr; }
-  .control-grid > :nth-child(3) { grid-column: 1 / -1; }
+  .control-grid > :nth-child(4) { grid-column: 1 / -1; }
   .stats-grid { grid-template-columns: 1fr 1fr; }
 }
 @media (max-width: 680px) {
   .control-grid, .form-grid { grid-template-columns: 1fr; }
-  .control-grid > :nth-child(3), .control-actions { grid-column: 1; }
+  .control-grid > :nth-child(4), .control-actions { grid-column: 1; }
   .stats-grid { grid-template-columns: 1fr 1fr; gap: 10px; }
   .member-header { flex-direction: column; align-items: stretch; }
   .member-filters { max-width: 100%; overflow-x: auto; }
