@@ -995,7 +995,7 @@ class TeamRotationController:
                     remaining=seats.get("remaining_default"),
                 )
 
-            candidate_available = db.has_team_rotation_candidate()
+            candidate_available = db.has_team_rotation_candidate(mother_id)
             cached_remaining = int(seats.get("remaining_default") or 0)
             if cached_remaining > 0 and candidate_available and detail is None:
                 refresh_team_detail()
@@ -1039,10 +1039,11 @@ class TeamRotationController:
                     joined_at=time.time(),
                     error="",
                 )
-                self._event("INFO", "join", "子号已加入 Team", mother_id, claim["email"])
+                join_message = "轮出子号已加入新 Team" if claim.get("recycled") else "子号已加入 Team"
+                self._event("INFO", "join", join_message, mother_id, claim["email"])
                 remaining -= 1
                 joined_count += 1
-                candidate_available = db.has_team_rotation_candidate()
+                candidate_available = db.has_team_rotation_candidate(mother_id)
 
             if remaining > 0 and not candidate_available and (force_team_refresh or removed_count):
                 self._event("WARNING", "pool", "注册成功账号池已无可用 Access Token", mother_id)

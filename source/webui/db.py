@@ -1353,24 +1353,53 @@ def record_team_mother_check(
 
 
 def claim_team_rotation_candidate(mother_id: str) -> Optional[dict]:
-    """Atomically reserve the oldest successful account never used by Team rotation."""
+    """Atomically reserve a fresh account or recycle one from another mother."""
     now = time.time()
     with _lock:
         con = _conn()
         try:
             con.execute("BEGIN IMMEDIATE")
             row = con.execute(
-                "SELECT r.email FROM registered AS r "
+                "SELECT r.email, tm.id AS assignment_id, "
+                "tm.mother_id AS previous_mother_id "
+                "FROM registered AS r "
+                "LEFT JOIN team_rotation_members AS tm "
+                "ON lower(tm.email)=lower(r.email) "
                 "WHERE coalesce(r.deleted_at, 0)=0 AND length(r.access_token)>0 "
-                "AND NOT EXISTS ("
-                "  SELECT 1 FROM team_rotation_members AS tm "
-                "  WHERE lower(tm.email)=lower(r.email)"
-                ") ORDER BY r.created_at ASC LIMIT 1"
+                "AND (tm.id IS NULL OR ("
+                "  tm.status IN ('exhausted','removed') AND tm.mother_id<>?"
+                ")) "
+                "ORDER BY CASE WHEN tm.id IS NULL THEN 0 ELSE 1 END, "
+                "r.created_at ASC LIMIT 1",
+                (mother_id,),
             ).fetchone()
             if not row:
                 con.rollback()
                 return None
             email = str(row["email"]).lower()
+            assignment_id = row["assignment_id"]
+            if assignment_id is not None:
+                con.execute(
+                    "UPDATE team_rotation_members SET mother_id=?, member_id=NULL, "
+                    "status='pending', primary_used_percent=NULL, "
+                    "secondary_used_percent=NULL, joined_at=NULL, "
+                    "last_checked_at=NULL, removed_at=NULL, error='', "
+                    "hub_status='pending', hub_pushed_at=NULL, "
+                    "hub_last_attempt_at=NULL, hub_error='', "
+                    "created_at=?, updated_at=? WHERE id=?",
+                    (mother_id, now, now, int(assignment_id)),
+                )
+                con.commit()
+                return {
+                    "id": int(assignment_id),
+                    "mother_id": mother_id,
+                    "previous_mother_id": str(row["previous_mother_id"] or ""),
+                    "email": email,
+                    "status": "pending",
+                    "recycled": True,
+                    "created_at": now,
+                    "updated_at": now,
+                }
             cur = con.execute(
                 "INSERT INTO team_rotation_members "
                 "(mother_id, email, status, created_at, updated_at) "
@@ -1383,6 +1412,7 @@ def claim_team_rotation_candidate(mother_id: str) -> Optional[dict]:
                 "mother_id": mother_id,
                 "email": email,
                 "status": "pending",
+                "recycled": False,
                 "created_at": now,
                 "updated_at": now,
             }
@@ -1393,17 +1423,19 @@ def claim_team_rotation_candidate(mother_id: str) -> Optional[dict]:
             con.close()
 
 
-def has_team_rotation_candidate() -> bool:
-    """Return whether a successful account has never entered Team rotation."""
+def has_team_rotation_candidate(mother_id: str) -> bool:
+    """Return whether this mother can claim a fresh or recycled account."""
     con = _conn()
     try:
         row = con.execute(
             "SELECT 1 FROM registered AS r "
+            "LEFT JOIN team_rotation_members AS tm "
+            "ON lower(tm.email)=lower(r.email) "
             "WHERE coalesce(r.deleted_at, 0)=0 AND length(r.access_token)>0 "
-            "AND NOT EXISTS ("
-            "  SELECT 1 FROM team_rotation_members AS tm "
-            "  WHERE lower(tm.email)=lower(r.email)"
-            ") LIMIT 1"
+            "AND (tm.id IS NULL OR ("
+            "  tm.status IN ('exhausted','removed') AND tm.mother_id<>?"
+            ")) LIMIT 1",
+            (mother_id,),
         ).fetchone()
         return row is not None
     finally:

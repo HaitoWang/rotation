@@ -363,6 +363,94 @@ class TeamRotationHubStateTests(unittest.TestCase):
         self.assertEqual(pushed_cred["name"], "重授权-child@example.com")
         self.assertEqual(pushed_cred["email"], "child@example.com")
 
+    def test_removed_account_can_be_recycled_by_another_mother(self):
+        mother_b = db.create_team_mother({
+            "name": "Team B",
+            "workspace_id": "team-workspace-b",
+            "access_token": "mother-b-access-token",
+            "enabled": True,
+        })
+        db.update_team_rotation_member(
+            self.assignment["id"],
+            status="removed",
+            member_id="member-a",
+            primary_used_percent=100.0,
+            secondary_used_percent=50.0,
+            joined_at=100.0,
+            last_checked_at=200.0,
+            removed_at=300.0,
+            error="额度达到 100%",
+            hub_status="success",
+            hub_pushed_at=150.0,
+            hub_last_attempt_at=140.0,
+            hub_error="old error",
+        )
+
+        self.assertFalse(db.has_team_rotation_candidate(self.mother["id"]))
+        self.assertIsNone(db.claim_team_rotation_candidate(self.mother["id"]))
+        self.assertTrue(db.has_team_rotation_candidate(mother_b["id"]))
+
+        claim = db.claim_team_rotation_candidate(mother_b["id"])
+        self.assertTrue(claim["recycled"])
+        self.assertEqual(claim["id"], self.assignment["id"])
+        self.assertEqual(claim["previous_mother_id"], self.mother["id"])
+        self.assertIsNone(db.find_team_rotation_member(
+            self.mother["id"], "child@example.com"
+        ))
+
+        recycled = db.find_team_rotation_member(
+            mother_b["id"], "child@example.com"
+        )
+        self.assertEqual(recycled["status"], "pending")
+        self.assertIsNone(recycled["member_id"])
+        self.assertIsNone(recycled["primary_used_percent"])
+        self.assertIsNone(recycled["secondary_used_percent"])
+        self.assertIsNone(recycled["joined_at"])
+        self.assertIsNone(recycled["last_checked_at"])
+        self.assertIsNone(recycled["removed_at"])
+        self.assertEqual(recycled["error"], "")
+        self.assertEqual(recycled["hub_status"], "pending")
+        self.assertIsNone(recycled["hub_pushed_at"])
+        self.assertIsNone(recycled["hub_last_attempt_at"])
+        self.assertEqual(recycled["hub_error"], "")
+
+    def test_exhausted_account_joins_another_mother(self):
+        mother_b_public = db.create_team_mother({
+            "name": "Team B",
+            "workspace_id": "team-workspace-b",
+            "access_token": "mother-b-access-token",
+            "enabled": True,
+        })
+        mother_b = db.get_team_mother(mother_b_public["id"], include_secret=True)
+        db.update_team_rotation_member(
+            self.assignment["id"],
+            status="exhausted",
+            removed_at=300.0,
+            error="额度达到 100%",
+            hub_status="success",
+        )
+        service = mock.Mock()
+        service.get_team_detail.return_value = {
+            "seats": {"entitled": 2, "in_use": 1, "remaining_default": 1},
+            "members": [],
+        }
+        service.invite_and_accept.return_value = {"member_id": "member-b"}
+        controller = TeamRotationController(
+            service_factory=mock.Mock(return_value=service)
+        )
+
+        with mock.patch.object(controller, "_push_assignment_to_hub") as push:
+            controller._process_mother(mother_b)
+
+        service.invite_and_accept.assert_called_once()
+        recycled = db.find_team_rotation_member(
+            mother_b["id"], "child@example.com"
+        )
+        self.assertEqual(recycled["status"], "active")
+        self.assertEqual(recycled["member_id"], "member-b")
+        self.assertEqual(recycled["hub_status"], "pending")
+        push.assert_called_once()
+
     def _quota_service(self, *quota_results):
         service = mock.Mock()
         service.get_team_detail.return_value = {
