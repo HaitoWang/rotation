@@ -576,6 +576,47 @@ class TeamRotationHubStateTests(unittest.TestCase):
                         },
                     )
 
+    def test_quota_refreshes_codex_token_before_usage_check(self):
+        service = TeamService()
+        try:
+            usage = {
+                "rate_limit": {
+                    "primary_window": {"used_percent": 37},
+                    "secondary_window": {"used_percent": 12},
+                }
+            }
+            with mock.patch(
+                "webui.exporter.refresh_codex_token",
+                return_value={
+                    "access_token": "fresh-codex-access",
+                    "refresh_token": "fresh-codex-refresh",
+                    "id_token": "fresh-id-token",
+                },
+            ) as refresh, mock.patch.object(
+                db, "update_registered_codex_tokens", return_value=True
+            ) as update, mock.patch.object(
+                service.client, "request", return_value=(200, usage)
+            ) as request:
+                result = service.check_quota(
+                    db.get_registered("child@example.com"),
+                    "team-workspace",
+                )
+
+            self.assertEqual(result["status"], "alive")
+            self.assertEqual(result["primary_used_percent"], 37.0)
+            refresh.assert_called_once_with("refresh-token")
+            update.assert_called_once_with(
+                "child@example.com",
+                refresh_token="fresh-codex-refresh",
+                id_token="fresh-id-token",
+            )
+            credentials = request.call_args.args[2]
+            self.assertEqual(credentials.access_token, "fresh-codex-access")
+            self.assertEqual(credentials.cookie_header, "")
+            self.assertEqual(request.call_args.kwargs["account_id"], "team-workspace")
+        finally:
+            service.close()
+
     def _quota_service(self, *quota_results):
         service = mock.Mock()
         service.get_team_detail.return_value = {
@@ -694,17 +735,25 @@ class TeamRotationHubStateTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertTrue(observed["want_refresh_token"])
 
-    def test_member_is_removed_only_when_quota_reaches_100_percent(self):
-        service = self._quota_service({
+    def test_member_is_removed_only_after_two_consecutive_100_percent_checks(self):
+        result = {
             "status": "alive",
             "http_status": 200,
             "primary_used_percent": 100.0,
             "secondary_used_percent": 40.0,
             "error": "",
-        })
+        }
+        service = self._quota_service(result, result)
+        db.update_team_rotation_member(self.assignment["id"], hub_status="success")
         controller = TeamRotationController(service_factory=mock.Mock(return_value=service))
         controller._process_mother(self.mother)
 
+        service.remove_member.assert_not_called()
+        updated = db.find_team_rotation_member(self.mother["id"], "child@example.com")
+        self.assertEqual(updated["status"], "active")
+        self.assertEqual(updated["error"], "额度达到 100%，等待下一轮复核")
+
+        controller._process_mother(self.mother)
         service.remove_member.assert_called_once_with(self.mother, "member-1")
         updated = db.find_team_rotation_member(self.mother["id"], "child@example.com")
         self.assertEqual(updated["status"], "exhausted")

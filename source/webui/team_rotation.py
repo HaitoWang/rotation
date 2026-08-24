@@ -587,8 +587,48 @@ class TeamService:
         return {"member_id": member_id, "email": child.email}
 
     def check_quota(self, account: dict, workspace_id: str) -> dict:
+        # Web Session Token may remain bound to the previous Team after recycling;
+        # use the same Codex OAuth refresh path as Hub before reading usage.
         credentials = self._credentials_from_registered(account)
-        self._resolve_access_token(credentials, "子号")
+        refresh_token = str(account.get("refresh_token") or "").strip()
+        if not refresh_token:
+            return {
+                "status": "auth_required",
+                "http_status": None,
+                "primary_used_percent": None,
+                "secondary_used_percent": None,
+                "error": "缺少 Codex Refresh Token，无法检查 Team 额度",
+            }
+        try:
+            from . import exporter
+
+            fresh = exporter.refresh_codex_token(refresh_token)
+            rotated_refresh = str(
+                fresh.get("refresh_token") or refresh_token
+            ).strip()
+            if not db.update_registered_codex_tokens(
+                account.get("email") or "",
+                refresh_token=rotated_refresh,
+                id_token=fresh.get("id_token") or "",
+            ):
+                raise RuntimeError("滚动后的 Codex Token 写回账号池失败")
+            credentials.access_token = str(fresh.get("access_token") or "").strip()
+            credentials.cookie_header = ""
+            credentials.account_id = str(workspace_id or "").strip()
+        except Exception as exc:
+            error = str(exc)
+            auth_invalid = any(marker in error.lower() for marker in (
+                "refresh_token_invalidated",
+                "session has ended",
+                "refresh_token 失效",
+            ))
+            return {
+                "status": "auth_required" if auth_invalid else "unknown",
+                "http_status": 401 if auth_invalid else None,
+                "primary_used_percent": None,
+                "secondary_used_percent": None,
+                "error": f"Codex Token 刷新失败: {error}",
+            }
         status, payload = self.client.request(
             "GET",
             "/backend-api/wham/usage",
@@ -1009,6 +1049,20 @@ class TeamRotationController:
                 exhausted = bool(values and max(values) >= 100.0)
                 if exhausted:
                     reason = f"额度达到 {max(values):g}%"
+                    confirmed = assignment.get("error") == "额度达到 100%，等待下一轮复核"
+                    if not confirmed:
+                        db.update_team_rotation_member(
+                            assignment["id"],
+                            error="额度达到 100%，等待下一轮复核",
+                        )
+                        self._event(
+                            "WARNING",
+                            "quota",
+                            "额度首次达到 100%，等待下一轮复核",
+                            mother_id,
+                            assignment["email"],
+                        )
+                        continue
                     self._remove_assignment(service, mother, assignment, reason, "exhausted")
                     removed_count += 1
 
