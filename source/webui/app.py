@@ -26,7 +26,7 @@ from pydantic import BaseModel, Field
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from . import db, export_formats, registrar, team_sso_sync  # noqa: E402
+from . import db, export_formats, registrar, sms_cancel_dispatcher, team_sso_sync  # noqa: E402
 from .auto_loop import CONTROLLER as AUTO_LOOP  # noqa: E402
 from .team_rotation import (  # noqa: E402
     CONTROLLER as TEAM_ROTATION,
@@ -60,6 +60,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("webui")
 team_sso_sync.start_dispatcher()
+sms_cancel_dispatcher.start_dispatcher()
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 

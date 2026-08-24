@@ -153,6 +153,7 @@ SMS_DEFAULT_SERVICE = "dr"
 SMS_DEFAULT_COUNTRY = "52"  # Thailand —— OpenAI 走 SMS 的稳定国家
 SMS_DEFAULT_SUPPLIER_STRATEGY = "success_first"
 SMS_PHONE_LIFETIME = 20 * 60  # 号码租用窗口（秒）
+HERO_CANCEL_MIN_AGE_SECONDS = 125  # HeroSMS 购买约 2 分钟后才允许主动取消
 _SMS_CACHE_LOCK = threading.Lock()
 _SMS_CACHE: dict[str, dict] = {}  # 按平台隔离，避免双平台互相覆盖号码租约
 _SMS_PLATFORM_LOCKS_LOCK = threading.Lock()
@@ -906,6 +907,27 @@ def _safe_bool(value, default: bool) -> bool:
     return str(value).strip().lower() not in {"0", "false", "no", "off", "否"}
 
 
+def _hero_price_priority_key(
+    row: dict, *, threshold: float = 0, min_stock: int = 0
+) -> tuple:
+    """HeroSMS routing key: threshold bucket, then the actual lowest price."""
+    price = _safe_float(row.get("price"), float("inf"))
+    if price <= 0:
+        price = float("inf")
+    threshold_bucket = 0 if threshold <= 0 or price <= threshold + 1e-9 else 1
+    count = _safe_int(row.get("count"), 0)
+    stock_bucket = 0 if count >= max(1, min_stock) else (1 if count > 0 else 2)
+    history_rate = _safe_float(row.get("history_success_rate"), -1.0)
+    return (
+        threshold_bucket,
+        price,
+        stock_bucket,
+        int(row.get("quality_tier") or 0),
+        -history_rate,
+        -count,
+    )
+
+
 def _project_cache_dir() -> Path:
     root = Path(__file__).resolve().parent
     cache = root / "data"
@@ -966,6 +988,75 @@ def _sms_catalog_file(platform: str) -> Path:
 
 def _sms_blacklist_file() -> Path:
     return _project_cache_dir() / ".sms_phone_blacklist.txt"
+
+
+def _track_sms_activation(
+    platform: str, activation_id: str, phone_number: str, acquired_at: float
+) -> None:
+    """Best-effort bridge to the WebUI's durable cleanup queue."""
+    try:
+        from webui import db as webui_db
+
+        webui_db.track_sms_activation(
+            platform,
+            activation_id,
+            phone_number=phone_number,
+            acquired_at=acquired_at,
+            lifetime_seconds=SMS_PHONE_LIFETIME,
+        )
+    except Exception as exc:
+        logger.warning(
+            "SMS 租号清理记录写入失败 platform=%s activation_id=%s: %s",
+            platform,
+            activation_id,
+            exc,
+        )
+
+
+def _queue_sms_activation_cancel(
+    platform: str,
+    activation_id: str,
+    *,
+    phone_number: str = "",
+    acquired_at: Optional[float] = None,
+    error: str = "",
+) -> None:
+    try:
+        from webui import db as webui_db
+
+        acquired = float(acquired_at or time.time())
+        not_before = time.time()
+        if str(platform or "").strip().lower() == "herosms":
+            not_before = max(not_before, acquired + HERO_CANCEL_MIN_AGE_SECONDS)
+        webui_db.queue_sms_activation_cancel(
+            platform,
+            activation_id,
+            phone_number=phone_number,
+            acquired_at=acquired,
+            not_before=not_before,
+            error=error,
+        )
+    except Exception as exc:
+        logger.warning(
+            "SMS 取消任务写入失败 platform=%s activation_id=%s: %s",
+            platform,
+            activation_id,
+            exc,
+        )
+
+
+def _complete_sms_activation_cleanup(platform: str, activation_id: str) -> None:
+    try:
+        from webui import db as webui_db
+
+        webui_db.complete_sms_activation_cleanup(platform, activation_id)
+    except Exception as exc:
+        logger.warning(
+            "SMS 清理记录完成失败 platform=%s activation_id=%s: %s",
+            platform,
+            activation_id,
+            exc,
+        )
 
 
 def _normalize_phone(phone: str) -> str:
@@ -1074,6 +1165,7 @@ class SmsBowerProvider(BaseSmsProvider):
         self._resend_callback: Optional[Callable[[], None]] = None
         self._should_stop_callback: Optional[Callable[[], bool]] = None
         self.last_code_result: Optional[dict] = None
+        self.last_cancel_error = ""
         self.current_activation: Optional[SmsActivation] = None
         self._used_codes: set[str] = set()
         self._ranked_providers_by_country: dict[str, list[dict]] = {}
@@ -1122,7 +1214,16 @@ class SmsBowerProvider(BaseSmsProvider):
         rows = []
         by_country: dict[str, list[dict]] = {}
         for cid, candidates in grouped.items():
-            candidates.sort(key=lambda row: (row["score"], -int(row.get("count") or 0)))
+            if self.platform_key == "herosms":
+                candidates.sort(
+                    key=lambda row: (
+                        _safe_float(row.get("price"), float("inf")),
+                        row["score"],
+                        -int(row.get("count") or 0),
+                    )
+                )
+            else:
+                candidates.sort(key=lambda row: (row["score"], -int(row.get("count") or 0)))
             by_country[cid] = candidates
             best = candidates[0]
             rows.append({
@@ -1134,6 +1235,12 @@ class SmsBowerProvider(BaseSmsProvider):
                 "provider_count": len(candidates),
             })
         ranked = _rank_country_rows(self.platform_key, rows)
+        if self.platform_key == "herosms":
+            ranked.sort(
+                key=lambda row: _hero_price_priority_key(
+                    row, threshold=self.max_price if self.max_price > 0 else 0
+                )
+            )
         self._ranked_providers_by_country = by_country
         with _SMS_RANKED_LOCK:
             _SMS_RANKED_CACHE[cache_key] = {
@@ -1616,10 +1723,16 @@ class SmsBowerProvider(BaseSmsProvider):
         # 单一 country 兜底
         if not country_candidates:
             country_candidates = [str(country or self.default_country or SMS_DEFAULT_COUNTRY).strip()]
-        # 调用方传入的顺序可能来自旧缓存/旧接口；有足够历史样本时仍先试高成功率国家。
-        country_candidates = _rotate_country_ids(
-            self.platform_key, _rank_country_ids(self.platform_key, list(country_candidates))
-        )
+        # Hero 的调用方顺序已经按阈值和价格排好，不能再被历史成功率重排。
+        # 其它平台继续沿用质量优先和同档轮转。
+        if self.platform_key == "herosms":
+            country_candidates = list(dict.fromkeys(
+                str(cid or "").strip() for cid in country_candidates if str(cid or "").strip()
+            ))
+        else:
+            country_candidates = _rotate_country_ids(
+                self.platform_key, _rank_country_ids(self.platform_key, list(country_candidates))
+            )
 
         if self.reuse_phone_to_max:
             with _SMS_CACHE_LOCK:
@@ -1646,6 +1759,7 @@ class SmsBowerProvider(BaseSmsProvider):
                                 "platform": self.platform_key,
                                 "count": 1,
                                 "supplier_strategy": self.supplier_strategy,
+                                "acquired_at": float(cache.get("acquired_at") or time.time()),
                             },
                         )
                         self.current_activation = activation
@@ -1683,7 +1797,16 @@ class SmsBowerProvider(BaseSmsProvider):
             for row in provider_rows:
                 row["country"] = cid
                 row["score"] = self._score_row(row)
-            provider_rows.sort(key=lambda row: (row["score"], -int(row.get("count") or 0)))
+            if self.platform_key == "herosms":
+                provider_rows.sort(
+                    key=lambda row: (
+                        _safe_float(row.get("price"), float("inf")),
+                        row["score"],
+                        -int(row.get("count") or 0),
+                    )
+                )
+            else:
+                provider_rows.sort(key=lambda row: (row["score"], -int(row.get("count") or 0)))
             country_inventory_empty = True
             for provider_row in provider_rows:
                 self._raise_if_stopped()
@@ -1717,6 +1840,10 @@ class SmsBowerProvider(BaseSmsProvider):
                                 phone = self._format_phone(info)
                                 if not aid or not phone.strip("+"):
                                     raise RuntimeError("返回信息不完整")
+                                acquired_at = time.time()
+                                _track_sms_activation(
+                                    self.platform_key, aid, phone, acquired_at
+                                )
                                 if self._stop_requested():
                                     self.cancel(aid, record_failure=False)
                                     raise RuntimeError("SMS 接码因任务停止而中止")
@@ -1742,6 +1869,7 @@ class SmsBowerProvider(BaseSmsProvider):
                                     "supplier_strategy": self.supplier_strategy,
                                     "selection_score": float(provider_row.get("score") or 0),
                                     "reservation_key": reservation_key,
+                                    "acquired_at": acquired_at,
                                 }
                                 cache = {
                                     **self._cache_identity(service_code, cid),
@@ -1750,7 +1878,7 @@ class SmsBowerProvider(BaseSmsProvider):
                                     "phone_number": phone,
                                     "provider_id": provider_id,
                                     "price": metadata["price"],
-                                    "acquired_at": time.time(),
+                                    "acquired_at": acquired_at,
                                     "use_count": 0,
                                     "used_codes": set(),
                                     "reuse_stopped": False,
@@ -1955,17 +2083,48 @@ class SmsBowerProvider(BaseSmsProvider):
             metadata["reservation_released"] = True
 
     def cancel(self, activation_id: str, *, record_failure: bool = True) -> bool:
-        try:
-            resp = self._request({"action": "cancelActivation", "id": activation_id})
-            ok = resp.status_code == 204 or "ACCESS_CANCEL" in resp.text
-        except Exception:
-            ok = False
-        if not ok:
+        activation = self.current_activation
+        metadata = (activation.metadata or {}) if activation else {}
+        acquired_at = _safe_float(metadata.get("acquired_at"), time.time())
+        phone_number = activation.phone_number if activation else ""
+        defer_hero_cancel = (
+            self.platform_key == "herosms"
+            and time.time() < acquired_at + HERO_CANCEL_MIN_AGE_SECONDS
+        )
+        # 先持久化再请求上游；进程即使在 HTTP 中途退出，后台仍能继续取消。
+        _queue_sms_activation_cancel(
+            self.platform_key,
+            activation_id,
+            phone_number=phone_number,
+            acquired_at=acquired_at,
+            error="等待 HeroSMS 可取消窗口" if defer_hero_cancel else "等待取消",
+        )
+        ok = False
+        cancel_errors: list[str] = []
+        if not defer_hero_cancel:
             try:
-                resp = self._request({"action": "setStatus", "id": activation_id, "status": 8})
-                ok = "ACCESS_CANCEL" in resp.text
-            except Exception:
+                resp = self._request({"action": "cancelActivation", "id": activation_id})
+                ok = resp.status_code == 204 or "ACCESS_CANCEL" in resp.text
+                if not ok:
+                    cancel_errors.append(resp.text.strip()[:240] or f"HTTP {resp.status_code}")
+            except Exception as exc:
+                cancel_errors.append(str(exc)[:240])
                 ok = False
+            if not ok:
+                try:
+                    resp = self._request({"action": "setStatus", "id": activation_id, "status": 8})
+                    ok = "ACCESS_CANCEL" in resp.text
+                    if not ok:
+                        cancel_errors.append(resp.text.strip()[:240] or f"HTTP {resp.status_code}")
+                except Exception as exc:
+                    cancel_errors.append(str(exc)[:240])
+                    ok = False
+        else:
+            cancel_errors.append("等待 HeroSMS 可取消窗口")
+            logger.info(
+                "HeroSMS activation_id=%s 尚未到可取消时间，已交给后台队列",
+                activation_id,
+            )
         with _SMS_CACHE_LOCK:
             cache = _SMS_CACHE.get(self.platform_key)
             if cache and str(cache.get("activation_id")) == str(activation_id):
@@ -1973,6 +2132,20 @@ class SmsBowerProvider(BaseSmsProvider):
         if record_failure:
             self._record_current_result(activation_id, success=False)
         self._release_current_reservation(activation_id)
+        if ok:
+            self.last_cancel_error = ""
+            _complete_sms_activation_cleanup(self.platform_key, activation_id)
+        elif cancel_errors and not defer_hero_cancel:
+            self.last_cancel_error = " | ".join(cancel_errors)
+            _queue_sms_activation_cancel(
+                self.platform_key,
+                activation_id,
+                phone_number=phone_number,
+                acquired_at=acquired_at,
+                error=self.last_cancel_error,
+            )
+        elif cancel_errors:
+            self.last_cancel_error = " | ".join(cancel_errors)
         return ok
 
     def report_success(self, activation_id: str) -> bool:
@@ -2004,8 +2177,15 @@ class SmsBowerProvider(BaseSmsProvider):
                     self._clear_cache()
         self._record_current_result(activation_id, success=True)
         self._release_current_reservation(activation_id)
+        finalized = should_finish or not (
+            cache and str(cache.get("activation_id")) == str(activation_id)
+        )
+        if finalized:
+            # 业务已经成功消费；即使 finishActivation 瞬时失败，也绝不能被
+            # 后台清理任务当作失败号码再取消。
+            _complete_sms_activation_cleanup(self.platform_key, activation_id)
         try:
-            if should_finish or not (cache and str(cache.get("activation_id")) == str(activation_id)):
+            if finalized:
                 resp = self._request({"action": "finishActivation", "id": activation_id})
                 return resp.status_code in (200, 204) or "ACCESS" in resp.text
         except Exception:
@@ -2044,16 +2224,16 @@ class SmsBowerProvider(BaseSmsProvider):
         self, activation_id: str, reason: str = "", *, record_failure: Optional[bool] = None
     ) -> None:
         # 业务侧拒了这个号 → cancel 退款（号根本没用上，不能让主人白花钱）
-        cancel_ok = False
-        try:
-            resp = self._request({"action": "setStatus", "id": activation_id, "status": 8})
-            cancel_ok = "ACCESS_CANCEL" in resp.text or resp.status_code in (200, 204)
-        except Exception:
-            pass
+        cancel_ok = self.cancel(activation_id, record_failure=False)
         # 简化原因显示：只保留前 80 字符
         short_reason = (reason or "未知原因")[:80]
-        logger.info("SmsBower 号 activation_id=%s cancel 退款 %s (原因: %s)",
-                    activation_id, "✅" if cancel_ok else "❌", short_reason)
+        logger.info(
+            "%s 号 activation_id=%s cancel 退款 %s (原因: %s)",
+            self.platform_key,
+            activation_id,
+            "已取消" if cancel_ok else "已进入后台重试",
+            short_reason,
+        )
         activation = self.current_activation
         if activation and _phone_rejected_reason(reason):
             if _add_phone_blacklist(activation.phone_number):
@@ -2311,27 +2491,49 @@ class PhoneCallbackController:
         allowed_raw = str(self.config.get("sms_allowed_countries") or "").strip()
         allowed_list = [c.strip() for c in allowed_raw.replace(";", ",").split(",") if c.strip()]
         country_candidates: list[str] = []
+
         def _top_rows() -> list[dict]:
             # 单飞与缓存已下沉到 get_top_countries，这里不再加全局锁。
             return provider.get_top_countries(service=self.service)
+
         if self.auto_select_country:
-            if allowed_list:
-                try:
-                    rows = _rank_country_rows(provider.platform_key, _top_rows())
-                    in_allow = [r for r in rows if str(r.get("country") or "") in allowed_list]
-                    ordered_allowed = [str(r["country"]) for r in in_allow]
-                    appended = [c for c in allowed_list if c not in ordered_allowed]
-                    country_candidates = ordered_allowed + appended
-                except Exception as e:
-                    logger.warning("%s 国家排名查询失败: %s", provider.platform_key, e)
-                    country_candidates = list(allowed_list)
-            else:
-                try:
-                    min_stock = _safe_int(self.config.get("sms_auto_min_stock"), 20)
-                    max_price = _safe_float(self.config.get("sms_auto_max_price"), 0)
-                    strict = _safe_bool(self.config.get("sms_strict_whitelist"), False)
-                    success_first = provider.supplier_strategy == "success_first"
-                    raw_rows = [dict(row) for row in _top_rows()]
+            try:
+                min_stock = _safe_int(self.config.get("sms_auto_min_stock"), 20)
+                max_price = _safe_float(self.config.get("sms_auto_max_price"), 0)
+                strict = _safe_bool(self.config.get("sms_strict_whitelist"), False)
+                success_first = provider.supplier_strategy == "success_first"
+                raw_rows = [dict(row) for row in _top_rows()]
+                rows = _rank_country_rows(provider.platform_key, raw_rows)
+
+                if provider.platform_key == "herosms":
+                    # Hero must see the complete live catalog. The configured
+                    # auto price is a soft threshold: under-threshold countries
+                    # are exhausted first, then higher prices remain as fallback.
+                    eligible = [
+                        row for row in rows
+                        if (not allowed_list or str(row.get("country") or "") in allowed_list)
+                        and (not strict or str(row.get("country") or "") in OPENAI_SMS_COUNTRIES)
+                    ]
+                    eligible.sort(
+                        key=lambda row: _hero_price_priority_key(
+                            row, threshold=max_price, min_stock=min_stock
+                        )
+                    )
+                    country_candidates = [str(row["country"]) for row in eligible]
+                    if allowed_list:
+                        country_candidates.extend(
+                            cid for cid in allowed_list if cid not in country_candidates
+                        )
+                elif allowed_list:
+                    in_allow = [
+                        row for row in rows
+                        if str(row.get("country") or "") in allowed_list
+                    ]
+                    country_candidates = [str(row["country"]) for row in in_allow]
+                    country_candidates.extend(
+                        cid for cid in allowed_list if cid not in country_candidates
+                    )
+                else:
                     if success_first:
                         # The catalog can omit countries that remain rentable.
                         # Reintroduce only historically proven countries; the
@@ -2354,11 +2556,9 @@ class PhoneCallbackController:
                                     "score": float("inf"),
                                     "history_only": True,
                                 })
-                    rows = _rank_country_rows(provider.platform_key, raw_rows)
+                        rows = _rank_country_rows(provider.platform_key, raw_rows)
                     eligible = [
                         row for row in rows
-                        # success_first 不用国家均价做预过滤；实际租号请求仍带 sms_max_price
-                        # 作为硬上限，因此只会多尝试高质量国家，不会突破预算。
                         if (
                             success_first
                             or max_price <= 0
@@ -2367,9 +2567,6 @@ class PhoneCallbackController:
                         and (not strict or str(row.get("country")) in OPENAI_SMS_COUNTRIES)
                     ]
                     if success_first:
-                        # A tier-2 country has enough evidence and less than
-                        # 15% SMS success. Do not burn numbers merely because
-                        # every better country is temporarily out of stock.
                         eligible = [
                             row for row in eligible
                             if int(row.get("quality_tier") or 0) < 2
@@ -2384,10 +2581,6 @@ class PhoneCallbackController:
                         for row in eligible
                         if _safe_int(row.get("count"), 0) >= max(1, min_stock)
                     ]
-                    # HeroSMS/SmsBower catalogs are advisory: production has
-                    # repeatedly returned NO_NUMBERS for large catalog counts
-                    # while a zero-count country rented immediately. Preserve
-                    # the ranked low/zero-stock rows as live-API fallbacks.
                     fallback = [
                         str(row["country"])
                         for row in eligible
@@ -2397,12 +2590,12 @@ class PhoneCallbackController:
                         [str(row["country"]) for row in eligible]
                         if success_first
                         else stocked + fallback
-                    ) or [self.country or SMS_DEFAULT_COUNTRY]
-                except SmsTemporarilyUnavailable:
-                    raise
-                except Exception as e:
-                    logger.warning("%s 国家智能选择失败: %s", provider.platform_key, e)
-                    country_candidates = [self.country] if self.country else []
+                    )
+            except SmsTemporarilyUnavailable:
+                raise
+            except Exception as e:
+                logger.warning("%s 国家智能选择失败: %s", provider.platform_key, e)
+                country_candidates = list(allowed_list) or ([self.country] if self.country else [])
         else:
             country_candidates = [self.country] if self.country else []
         if not country_candidates:

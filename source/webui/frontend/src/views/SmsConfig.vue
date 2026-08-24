@@ -196,7 +196,7 @@ onActivated(() => load())
 
         <el-row :gutter="16">
           <el-col :span="12">
-            <el-form-item label="号码最高单价（SmsBower；空=不限）">
+            <el-form-item label="号码硬性最高单价（空=不限）">
               <el-input v-model="maxPrice" placeholder="0.5" />
             </el-form-item>
           </el-col>
@@ -210,9 +210,9 @@ onActivated(() => load())
         <el-form-item>
           <el-checkbox v-model="reusePhone"><b>启用号码复用</b>（gpt风控，号码短时间无法复用）</el-checkbox>
         </el-form-item>
-        <el-divider content-position="left">自动选择最优国家（按价格 + 库存）</el-divider>
+        <el-divider content-position="left">自动选择国家</el-divider>
         <el-form-item>
-          <el-checkbox v-model="autoCountry"><b>启用自动选国家</b>（从下面"允许的国家"里按价格+库存自动挑最优）</el-checkbox>
+          <el-checkbox v-model="autoCountry"><b>启用自动选国家</b>（HeroSMS 获取全部国家价格，低价优先）</el-checkbox>
         </el-form-item>
         <el-row :gutter="16">
           <el-col :span="12">
@@ -221,7 +221,7 @@ onActivated(() => load())
             </el-form-item>
           </el-col>
           <el-col :span="12">
-            <el-form-item label="最高单价（0=不限）">
+            <el-form-item label="优先价格阈值（0=不限，阈值外作兜底）">
               <el-input v-model="autoMaxPrice" placeholder="0" />
             </el-form-item>
           </el-col>

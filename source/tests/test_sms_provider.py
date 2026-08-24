@@ -41,8 +41,17 @@ class SmsProviderRankingTests(unittest.TestCase):
         self.cache_dir = Path(self.temp_dir.name)
         self.cache_patch = mock.patch.object(sms_provider, "_project_cache_dir", return_value=self.cache_dir)
         self.cache_patch.start()
+        self.cleanup_patches = [
+            mock.patch.object(sms_provider, "_track_sms_activation"),
+            mock.patch.object(sms_provider, "_queue_sms_activation_cancel"),
+            mock.patch.object(sms_provider, "_complete_sms_activation_cleanup"),
+        ]
+        for patcher in self.cleanup_patches:
+            patcher.start()
 
     def tearDown(self):
+        for patcher in reversed(self.cleanup_patches):
+            patcher.stop()
         self.cache_patch.stop()
         self.temp_dir.cleanup()
 
@@ -176,14 +185,15 @@ class SmsProviderRankingTests(unittest.TestCase):
         self.assertGreater(remaining, 25)
         self.assertLess(remaining, 60)
 
-    def test_success_first_keeps_proven_history_and_rejects_known_bad_country(self):
+    def test_hero_uses_all_live_countries_and_orders_by_price(self):
         provider = sms_provider.SmsBowerProvider(
             "key", platform_key="herosms", supplier_strategy="success_first"
         )
         rows = [
-            {"country": "18", "price": 0.05, "count": 1400, "score": 1.0},
-            {"country": "32", "price": 0.05, "count": 0, "score": 2.0},
+            {"country": "18", "price": 0.35, "count": 1400, "score": 1.0},
+            {"country": "32", "price": 0.20, "count": 0, "score": 2.0},
             {"country": "4", "price": 0.02, "count": 5000, "score": 0.1},
+            {"country": "82", "price": 0.25, "count": 500, "score": 0.2},
         ]
         controller = sms_provider.PhoneCallbackController(
             "herosms",
@@ -201,34 +211,100 @@ class SmsProviderRankingTests(unittest.TestCase):
                     sms_provider,
                     "_country_quality_map",
                     return_value={
-                        "82": (0.29, 820),
-                        "18": (0.28, 100),
-                        "32": (0.24, 100),
+                        "82": (0.90, 820),
+                        "18": (0.95, 100),
+                        "32": (0.80, 100),
                         "4": (0.01, 5000),
                     },
                 ):
             candidates = controller._country_candidates(provider)
 
-        self.assertEqual(candidates, ["82", "18", "32"])
-        self.assertNotIn("4", candidates)
+        self.assertEqual(candidates, ["4", "32", "82", "18"])
 
-    def test_success_first_waits_instead_of_using_only_known_bad_country(self):
+    def test_hero_preserves_price_order_when_renting(self):
         provider = sms_provider.SmsBowerProvider(
             "key", platform_key="herosms", supplier_strategy="success_first"
         )
-        controller = sms_provider.PhoneCallbackController(
-            "herosms",
-            {"sms_supplier_strategy": "success_first", "sms_auto_min_stock": "20"},
-            service="dr",
-            auto_select_country=True,
+        provider._ranked_providers_by_country = {
+            "4": [{"provider_id": 101, "price": 0.02, "count": 20}],
+            "18": [{"provider_id": 202, "price": 0.35, "count": 20}],
+        }
+        calls = []
+
+        def _rent(_action, _service, country, provider_id=0):
+            calls.append((country, provider_id))
+            if country == "4":
+                raise RuntimeError("NO_NUMBERS")
+            return {"activationId": "paid", "phoneNumber": "33123456789"}
+
+        with mock.patch.object(provider, "_request_number_single_action", side_effect=_rent), \
+                mock.patch.object(
+                    sms_provider,
+                    "_country_quality_map",
+                    return_value={"4": (0.01, 5000), "18": (0.99, 5000)},
+                ):
+            activation = provider.get_number(
+                service="dr", country_candidates=["4", "18"]
+            )
+
+        self.assertEqual(activation.country, "18")
+        self.assertEqual([country for country, _ in calls], ["4", "18"])
+
+    def test_hero_uses_cheapest_provider_inside_country(self):
+        provider = sms_provider.SmsBowerProvider(
+            "key", platform_key="herosms", supplier_strategy="success_first"
         )
-        with mock.patch.object(provider, "get_top_countries", return_value=[{
-            "country": "4", "price": 0.02, "count": 5000, "score": 0.1,
-        }]), mock.patch.object(
-            sms_provider, "_country_quality_map", return_value={"4": (0.01, 5000)}
-        ):
-            with self.assertRaises(sms_provider.SmsTemporarilyUnavailable):
-                controller._country_candidates(provider)
+        provider._ranked_providers_by_country = {
+            "52": [
+                {"provider_id": 101, "price": 0.20, "count": 50},
+                {"provider_id": 202, "price": 0.03, "count": 50},
+            ]
+        }
+        calls = []
+
+        def _rent(_action, _service, country, provider_id=0):
+            calls.append((country, provider_id))
+            return {"activationId": "cheap", "phoneNumber": "66123456789"}
+
+        with mock.patch.object(provider, "_request_number_single_action", side_effect=_rent):
+            provider.get_number(service="dr", country_candidates=["52"])
+
+        self.assertEqual(calls, [("52", 202)])
+
+    def test_cancel_is_queued_before_remote_call_and_removed_on_success(self):
+        provider = sms_provider.SmsBowerProvider("key", platform_key="herosms")
+        provider.current_activation = sms_provider.SmsActivation(
+            "activation-1",
+            "+66123456789",
+            "52",
+            {"acquired_at": time.time() - 130},
+        )
+        queued = mock.Mock()
+        completed = mock.Mock()
+        response = mock.Mock(status_code=204, text="")
+        with mock.patch.object(sms_provider, "_queue_sms_activation_cancel", queued), \
+                mock.patch.object(sms_provider, "_complete_sms_activation_cleanup", completed), \
+                mock.patch.object(provider, "_request", return_value=response):
+            self.assertTrue(provider.cancel("activation-1", record_failure=False))
+
+        queued.assert_called_once()
+        completed.assert_called_once_with("herosms", "activation-1")
+
+    def test_hero_early_cancel_waits_for_background_window(self):
+        provider = sms_provider.SmsBowerProvider("key", platform_key="herosms")
+        provider.current_activation = sms_provider.SmsActivation(
+            "activation-early",
+            "+66123456789",
+            "52",
+            {"acquired_at": time.time()},
+        )
+        queued = mock.Mock()
+        with mock.patch.object(sms_provider, "_queue_sms_activation_cancel", queued), \
+                mock.patch.object(provider, "_request") as request:
+            self.assertFalse(provider.cancel("activation-early", record_failure=False))
+
+        queued.assert_called_once()
+        request.assert_not_called()
 
     def test_non_reused_numbers_do_not_take_a_global_lock_or_cache(self):
         provider = sms_provider.SmsBowerProvider(

@@ -185,6 +185,25 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_team_sso_sync_due
         ON team_sso_sync_queue(next_attempt_at, lease_until);
 
+        CREATE TABLE IF NOT EXISTS sms_activation_cleanup (
+            platform        TEXT NOT NULL,
+            activation_id   TEXT NOT NULL,
+            phone_number    TEXT,
+            acquired_at     REAL NOT NULL,
+            cancel_after    REAL NOT NULL,
+            status          TEXT NOT NULL DEFAULT 'active',
+                            -- active / pending_cancel
+            attempts        INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at REAL NOT NULL DEFAULT 0,
+            lease_until     REAL NOT NULL DEFAULT 0,
+            last_error      TEXT,
+            updated_at      REAL NOT NULL,
+            PRIMARY KEY(platform, activation_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_sms_activation_cleanup_due
+        ON sms_activation_cleanup(status, next_attempt_at, cancel_after, lease_until);
+
         CREATE TABLE IF NOT EXISTS team_mothers (
             id                TEXT PRIMARY KEY,
             name              TEXT NOT NULL,
@@ -1703,6 +1722,201 @@ def team_sso_sync_pending_count() -> int:
     return int(row[0] or 0)
 
 
+# ──────────────────────── SMS 租号清理队列 ────────────────────────
+
+
+def track_sms_activation(
+    platform: str,
+    activation_id: str,
+    *,
+    phone_number: str = "",
+    acquired_at: Optional[float] = None,
+    lifetime_seconds: float = 20 * 60,
+) -> None:
+    """Persist a fresh rental so an interrupted process cannot orphan it."""
+    platform_key = str(platform or "").strip().lower()
+    activation_key = str(activation_id or "").strip()
+    if not platform_key or not activation_key:
+        raise ValueError("platform/activation_id 不能为空")
+    acquired = float(acquired_at or time.time())
+    now = time.time()
+    # Leave a short grace after the advertised lifetime so a final reuse near
+    # the boundary is not cancelled underneath an in-flight verification.
+    cancel_after = acquired + max(60.0, float(lifetime_seconds)) + 60.0
+    with _lock:
+        con = _conn()
+        try:
+            con.execute(
+                "INSERT INTO sms_activation_cleanup "
+                "(platform, activation_id, phone_number, acquired_at, cancel_after, status, "
+                " attempts, next_attempt_at, lease_until, last_error, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, 'active', 0, 0, 0, '', ?) "
+                "ON CONFLICT(platform, activation_id) DO UPDATE SET "
+                "phone_number=CASE WHEN excluded.phone_number<>'' THEN excluded.phone_number "
+                "                  ELSE sms_activation_cleanup.phone_number END, "
+                "updated_at=excluded.updated_at",
+                (
+                    platform_key,
+                    activation_key,
+                    str(phone_number or "").strip(),
+                    acquired,
+                    cancel_after,
+                    now,
+                ),
+            )
+            con.commit()
+        finally:
+            con.close()
+
+
+def queue_sms_activation_cancel(
+    platform: str,
+    activation_id: str,
+    *,
+    phone_number: str = "",
+    acquired_at: Optional[float] = None,
+    not_before: Optional[float] = None,
+    error: str = "",
+) -> None:
+    """Mark a rental for background cancellation without resetting retry state."""
+    platform_key = str(platform or "").strip().lower()
+    activation_key = str(activation_id or "").strip()
+    if not platform_key or not activation_key:
+        return
+    now = time.time()
+    acquired = float(acquired_at or now)
+    due = max(now, float(not_before or now))
+    with _lock:
+        con = _conn()
+        try:
+            con.execute(
+                "INSERT INTO sms_activation_cleanup "
+                "(platform, activation_id, phone_number, acquired_at, cancel_after, status, "
+                " attempts, next_attempt_at, lease_until, last_error, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, 'pending_cancel', 0, ?, 0, ?, ?) "
+                "ON CONFLICT(platform, activation_id) DO UPDATE SET "
+                "status='pending_cancel', "
+                "phone_number=CASE WHEN excluded.phone_number<>'' THEN excluded.phone_number "
+                "                  ELSE sms_activation_cleanup.phone_number END, "
+                "next_attempt_at=CASE "
+                "  WHEN sms_activation_cleanup.status='active' THEN excluded.next_attempt_at "
+                "  ELSE min(sms_activation_cleanup.next_attempt_at, excluded.next_attempt_at) END, "
+                "last_error=excluded.last_error, updated_at=excluded.updated_at",
+                (
+                    platform_key,
+                    activation_key,
+                    str(phone_number or "").strip(),
+                    acquired,
+                    acquired + 20 * 60,
+                    due,
+                    str(error or "")[:1000],
+                    now,
+                ),
+            )
+            con.commit()
+        finally:
+            con.close()
+
+
+def claim_sms_activation_cancellations(
+    limit: int = 16, lease_seconds: float = 45.0
+) -> list[dict]:
+    """Lease due failures and stale active rentals for one cleanup worker."""
+    now = time.time()
+    count = max(1, min(int(limit or 1), 100))
+    with _lock:
+        con = _conn()
+        con.execute("BEGIN IMMEDIATE")
+        try:
+            rows = con.execute(
+                "SELECT platform, activation_id, phone_number, acquired_at, attempts, status "
+                "FROM sms_activation_cleanup "
+                "WHERE lease_until<=? AND ("
+                " (status='pending_cancel' AND next_attempt_at<=?) OR "
+                " (status='active' AND cancel_after<=?)"
+                ") ORDER BY CASE status WHEN 'pending_cancel' THEN 0 ELSE 1 END, "
+                "next_attempt_at, cancel_after LIMIT ?",
+                (now, now, now, count),
+            ).fetchall()
+            for row in rows:
+                con.execute(
+                    "UPDATE sms_activation_cleanup "
+                    "SET status='pending_cancel', lease_until=?, updated_at=? "
+                    "WHERE platform=? AND activation_id=?",
+                    (
+                        now + max(5.0, float(lease_seconds)),
+                        now,
+                        row["platform"],
+                        row["activation_id"],
+                    ),
+                )
+            con.commit()
+        except Exception:
+            con.rollback()
+            raise
+        finally:
+            con.close()
+    return [dict(row) for row in rows]
+
+
+def complete_sms_activation_cleanup(platform: str, activation_id: str) -> bool:
+    with _lock:
+        con = _conn()
+        try:
+            cur = con.execute(
+                "DELETE FROM sms_activation_cleanup WHERE platform=? AND activation_id=?",
+                (str(platform or "").strip().lower(), str(activation_id or "").strip()),
+            )
+            con.commit()
+            return cur.rowcount > 0
+        finally:
+            con.close()
+
+
+def fail_sms_activation_cleanup(platform: str, activation_id: str, error: str) -> None:
+    """Release a failed cancellation lease with bounded exponential backoff."""
+    platform_key = str(platform or "").strip().lower()
+    activation_key = str(activation_id or "").strip()
+    with _lock:
+        con = _conn()
+        try:
+            row = con.execute(
+                "SELECT attempts FROM sms_activation_cleanup "
+                "WHERE platform=? AND activation_id=?",
+                (platform_key, activation_key),
+            ).fetchone()
+            if not row:
+                return
+            attempts = int(row["attempts"] or 0) + 1
+            delay = min(15 * 60.0, max(15.0, float(15 * (2 ** min(attempts - 1, 6)))))
+            now = time.time()
+            con.execute(
+                "UPDATE sms_activation_cleanup SET status='pending_cancel', attempts=?, "
+                "next_attempt_at=?, lease_until=0, last_error=?, updated_at=? "
+                "WHERE platform=? AND activation_id=?",
+                (
+                    attempts,
+                    now + delay,
+                    str(error or "")[:1000],
+                    now,
+                    platform_key,
+                    activation_key,
+                ),
+            )
+            con.commit()
+        finally:
+            con.close()
+
+
+def sms_activation_cleanup_pending_count() -> int:
+    con = _conn()
+    try:
+        row = con.execute("SELECT COUNT(*) FROM sms_activation_cleanup").fetchone()
+        return int(row[0] or 0)
+    finally:
+        con.close()
+
+
 def delete_registered(email: str) -> bool:
     with _lock:
         con = _conn()
@@ -1928,12 +2142,12 @@ def get_sms_config() -> dict:
     sms_provider:       smsbower
     sms_country:        国家代码或 ID（推荐 '52' = Thailand，OpenAI 走 SMS 的唯一稳定国家）
     sms_service:        服务代码（OpenAI = 'dr'）
-    sms_max_price:      号码最高单价（SmsBower / SmsBower 用，单位平台货币；空 / -1 = 不限）
+    sms_max_price:      号码硬性最高单价（SmsBower / HeroSMS；空 / -1 = 不限）
     sms_reuse_phone:    '0'/'1' 同号复用（SmsBower / SmsBower 支持，省钱）
     sms_phone_success_max: 同号最多复用几次（默认 3）
-    sms_auto_country:   '0'/'1' 自动选最优国家（按价格 + 库存）
+    sms_auto_country:   '0'/'1' 自动选国家
     sms_auto_min_stock: 自动选国家最低库存（默认 20）
-    sms_auto_max_price: 自动选国家最高单价（默认 0 = 不限）
+    sms_auto_max_price: HeroSMS 优先价格阈值（默认 0 = 不限；阈值外作兜底）
     """
     legacy_provider = get_setting("sms_provider", "smsbower")
     legacy_key = get_setting("sms_api_key", "")
