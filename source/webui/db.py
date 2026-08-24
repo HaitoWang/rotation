@@ -2311,6 +2311,7 @@ def get_export_config() -> dict:
             get_setting("export_sub2api_models", default_models_json), fallback=()
         ),
         "sub2api_concurrency": get_setting("export_sub2api_concurrency", "3"),
+        "sub2api_fingerprint_mode": get_setting("export_sub2api_fingerprint_mode", "session"),
         "sub2api_timeout":    get_setting("export_sub2api_timeout", "30"),
         # team-sso free 账号池
         "team_sso_enabled":  get_setting("export_team_sso_enabled", os.getenv("TEAM_SSO_SYNC_ENABLED", "0")),
@@ -2346,6 +2347,7 @@ def save_export_config(data: dict) -> None:
         ("sub2api_group_ids",  "export_sub2api_group_ids"),
         ("sub2api_default_model", "export_sub2api_default_model"),
         ("sub2api_concurrency", "export_sub2api_concurrency"),
+        ("sub2api_fingerprint_mode", "export_sub2api_fingerprint_mode"),
         ("sub2api_timeout",    "export_sub2api_timeout"),
         ("team_sso_url",       "export_team_sso_url"),
         ("team_sso_timeout",   "export_team_sso_timeout"),
@@ -2361,6 +2363,11 @@ def save_export_config(data: dict) -> None:
         if default_model not in models:
             models.append(default_model)
         set_setting("export_sub2api_models", json.dumps(models, ensure_ascii=False))
+    if "sub2api_fingerprint_mode" in data:
+        mode = str(data.get("sub2api_fingerprint_mode") or "session").strip().lower()
+        if mode not in ("off", "device", "session", "full"):
+            mode = "session"
+        set_setting("export_sub2api_fingerprint_mode", mode)
     # 密文字段（'***' 不修改）
     if data.get("cpa_mgmt_key") and data["cpa_mgmt_key"] != "***":
         set_setting("export_cpa_mgmt_key", str(data["cpa_mgmt_key"]).strip())
@@ -2394,6 +2401,7 @@ def get_export_internal_config() -> dict:
             get_setting("export_sub2api_models", default_models_json), fallback=()
         ),
         "sub2api_concurrency": get_setting("export_sub2api_concurrency", "3"),
+        "sub2api_fingerprint_mode": get_setting("export_sub2api_fingerprint_mode", "session"),
         "sub2api_timeout":    get_setting("export_sub2api_timeout", "30"),
     }
     team_sso = {

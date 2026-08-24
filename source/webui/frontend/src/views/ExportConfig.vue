@@ -17,6 +17,12 @@ const defaultSub2ApiModels = [
   'gpt-5.6-terra',
   'codex-auto-review',
 ]
+const fingerprintModes = [
+  { value: 'off', label: '关闭 (off)' },
+  { value: 'device', label: '设备固定 (device)' },
+  { value: 'session', label: '设备与会话固定 (session)' },
+  { value: 'full', label: '账号级完全固定 (full)' },
+]
 const cpa = reactive({ enabled: false, url: '', key: '', keyPh: '粘贴 CPA 管理密钥', timeout: 30 })
 const sub = reactive({
   enabled: false,
@@ -27,6 +33,7 @@ const sub = reactive({
   groups: [],
   models: [...defaultSub2ApiModels],
   concurrency: 3,
+  fingerprintMode: 'session',
   timeout: 30,
 })
 const saving = ref(false)
@@ -53,6 +60,7 @@ async function load() {
     const savedModels = Array.isArray(config.sub2api_models) ? config.sub2api_models : []
     sub.models = [...new Set([...defaultSub2ApiModels, ...savedModels])]
     sub.concurrency = Number(config.sub2api_concurrency || 3)
+    sub.fingerprintMode = config.sub2api_fingerprint_mode || 'session'
     sub.timeout = Number(config.sub2api_timeout || 30)
     team.enabled = config.team_sso_enabled === '1'
     team.url = config.team_sso_url || ''
@@ -101,6 +109,7 @@ async function save() {
       sub2api_group_ids: sub.groupIds.join(','),
       sub2api_models: [...new Set(sub.models)],
       sub2api_concurrency: String(sub.concurrency || 3),
+      sub2api_fingerprint_mode: sub.fingerprintMode || 'session',
       sub2api_timeout: String(sub.timeout || 30),
       team_sso_enabled: team.enabled ? '1' : '0',
       team_sso_url: team.url.trim(),
@@ -185,6 +194,16 @@ onActivated(() => load())
         </el-form-item>
         <el-form-item label="账号并发数">
           <el-input-number v-model="sub.concurrency" :min="1" :max="1000" />
+        </el-form-item>
+        <el-form-item label="Codex 指纹收敛">
+          <el-select v-model="sub.fingerprintMode" style="width: 280px">
+            <el-option
+              v-for="mode in fingerprintModes"
+              :key="mode.value"
+              :label="mode.label"
+              :value="mode.value"
+            />
+          </el-select>
         </el-form-item>
         <el-form-item label="超时 (秒)">
           <el-input-number v-model="sub.timeout" :min="5" :max="300" />

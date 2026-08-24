@@ -53,6 +53,8 @@ DEFAULT_SUB2API_MODELS = (
     "codex-auto-review",
 )
 DEFAULT_SUB2API_CONCURRENCY = 3
+DEFAULT_SUB2API_FINGERPRINT_MODE = "session"
+SUB2API_FINGERPRINT_MODES = ("off", "device", "session", "full")
 SUB2API_DEFAULT_EXPIRES_IN = 863999  # 跟 any-auto-register 一致
 MAX_ATTEMPTS = 3
 RETRY_DELAYS_S = [3.0, 7.0]
@@ -511,6 +513,7 @@ def build_sub2api_payload(
     default_model: str = DEFAULT_SUB2API_MODEL,
     supported_models: Any = None,
     concurrency: int = DEFAULT_SUB2API_CONCURRENCY,
+    fingerprint_mode: str = DEFAULT_SUB2API_FINGERPRINT_MODE,
 ) -> dict:
     """构建 Hub batch API 中的一条 OAuth account。
 
@@ -574,7 +577,7 @@ def build_sub2api_payload(
     model_mapping = {item: item for item in models}
     model_mapping["codex-main"] = model
 
-    return {
+    account = {
         "name": display_name,
         "notes": str(cred.get("notes") or "批量导入"),
         "platform": "openai",
@@ -599,6 +602,12 @@ def build_sub2api_payload(
         "rate_multiplier": 1,
         "auto_pause_on_expired": True,
     }
+    mode = str(fingerprint_mode or DEFAULT_SUB2API_FINGERPRINT_MODE).strip().lower()
+    if mode not in SUB2API_FINGERPRINT_MODES:
+        mode = DEFAULT_SUB2API_FINGERPRINT_MODE
+    if mode != "off":
+        account["extra"] = {"codex_fingerprint_mode": mode}
+    return account
 
 
 # ──────────────────────── SUB2API：上传 ────────────────────────
@@ -628,6 +637,11 @@ def export_to_sub2api(cred: dict, cfg: dict, *,
     concurrency = _positive_int(
         cfg.get("sub2api_concurrency"), DEFAULT_SUB2API_CONCURRENCY
     )
+    fingerprint_mode = str(
+        cfg.get("sub2api_fingerprint_mode") or DEFAULT_SUB2API_FINGERPRINT_MODE
+    ).strip().lower()
+    if fingerprint_mode not in SUB2API_FINGERPRINT_MODES:
+        fingerprint_mode = DEFAULT_SUB2API_FINGERPRINT_MODE
     timeout = int(cfg.get("sub2api_timeout") or DEFAULT_TIMEOUT)
     cffi = _import_cffi()
 
@@ -637,6 +651,7 @@ def export_to_sub2api(cred: dict, cfg: dict, *,
         default_model=default_model,
         supported_models=supported_models,
         concurrency=concurrency,
+        fingerprint_mode=fingerprint_mode,
     )
     payload = {"accounts": [account_payload]}
     email = account_payload.get("name") or "unknown"
@@ -646,7 +661,7 @@ def export_to_sub2api(cred: dict, cfg: dict, *,
     ).hexdigest()[:16]
     idempotency_seed = (
         f"{email}\0{account_payload['credentials'].get('chatgpt_account_id', '')}"
-        f"\0{access_token_fingerprint}"
+        f"\0{access_token_fingerprint}\0{fingerprint_mode}"
     )
     idempotency_key = "openai-oauth-import-" + hashlib.sha256(
         idempotency_seed.encode("utf-8")
@@ -665,7 +680,8 @@ def export_to_sub2api(cred: dict, cfg: dict, *,
             log(
                 f"[SUB2API] 第 {attempt}/{MAX_ATTEMPTS} 次上传 {email} "
                 f"(group_ids={group_ids}, default_model={default_model}, "
-                f"models={len(supported_models)}, concurrency={concurrency})...",
+                f"models={len(supported_models)}, concurrency={concurrency}, "
+                f"fingerprint={fingerprint_mode})...",
                 "info",
             )
             resp = cffi.post(

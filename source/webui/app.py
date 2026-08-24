@@ -817,6 +817,7 @@ class SaveExportConfigReq(BaseModel):
     sub2api_default_model: Optional[str] = None
     sub2api_models: Optional[list[str] | str] = None
     sub2api_concurrency: Optional[str] = None
+    sub2api_fingerprint_mode: Optional[str] = None
     sub2api_timeout: Optional[str] = None
     # team-sso free 账号池
     team_sso_enabled: Optional[str] = None

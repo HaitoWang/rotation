@@ -68,6 +68,21 @@ class Sub2ApiHubPayloadTests(unittest.TestCase):
         self.assertEqual(account["priority"], 0)
         self.assertEqual(account["rate_multiplier"], 1)
         self.assertIsNone(account["proxy_id"])
+        self.assertEqual(account["extra"], {
+            "codex_fingerprint_mode": "session",
+        })
+
+    def test_fingerprint_off_omits_extra(self):
+        account = exporter.build_sub2api_payload(
+            {
+                "email": "user@example.com",
+                "access_token": self.access_token,
+            },
+            [12],
+            fingerprint_mode="off",
+        )
+
+        self.assertNotIn("extra", account)
 
     def test_export_uses_batch_endpoint_and_stable_idempotency_header(self):
         response = mock.Mock(status_code=201)
@@ -82,6 +97,7 @@ class Sub2ApiHubPayloadTests(unittest.TestCase):
             "sub2api_default_model": "gpt-5.4",
             "sub2api_models": ["gpt-image-2", "gpt-5.4", "gpt-5.6-terra"],
             "sub2api_concurrency": "3",
+            "sub2api_fingerprint_mode": "full",
             "sub2api_timeout": "30",
         }
         cred = {
@@ -104,6 +120,9 @@ class Sub2ApiHubPayloadTests(unittest.TestCase):
         self.assertEqual(kwargs["headers"]["x-api-key"], "admin-key")
         self.assertEqual(kwargs["headers"]["Idempotency-Key"], first["idempotency_key"])
         self.assertEqual(len(kwargs["json"]["accounts"]), 1)
+        self.assertEqual(kwargs["json"]["accounts"][0]["extra"], {
+            "codex_fingerprint_mode": "full",
+        })
         self.assertEqual(
             kwargs["json"]["accounts"][0]["credentials"]["model_mapping"],
             {
@@ -139,6 +158,35 @@ class Sub2ApiHubPayloadTests(unittest.TestCase):
             )
 
         self.assertNotEqual(before["idempotency_key"], after["idempotency_key"])
+
+    def test_fingerprint_mode_uses_a_new_idempotency_key(self):
+        response = mock.Mock(status_code=201)
+        response.json.return_value = {"accounts": [{"id": "hub-account-1"}]}
+        response.text = ""
+        cffi = mock.Mock()
+        cffi.post.return_value = response
+        base_cfg = {
+            "sub2api_url": "https://hub.example.com",
+            "sub2api_api_key": "admin-key",
+            "sub2api_group_ids": "12",
+        }
+        cred = {
+            "email": "user@example.com",
+            "access_token": self.access_token,
+            "account_id": "team-workspace",
+        }
+
+        with mock.patch.object(exporter, "_import_cffi", return_value=cffi):
+            session_result = exporter.export_to_sub2api(
+                cred, {**base_cfg, "sub2api_fingerprint_mode": "session"}
+            )
+            full_result = exporter.export_to_sub2api(
+                cred, {**base_cfg, "sub2api_fingerprint_mode": "full"}
+            )
+
+        self.assertNotEqual(
+            session_result["idempotency_key"], full_result["idempotency_key"]
+        )
 
     def test_run_exports_persists_rotated_refresh_token_before_upload(self):
         token_update = mock.Mock()
@@ -252,6 +300,7 @@ class TeamRotationHubStateTests(unittest.TestCase):
             "sub2api_default_model": "gpt-5.4",
             "sub2api_models": ["gpt-image-2", "gpt-5.4", "custom-model"],
             "sub2api_concurrency": "3",
+            "sub2api_fingerprint_mode": "device",
         })
 
         public_cfg = db.get_export_config()
@@ -259,6 +308,8 @@ class TeamRotationHubStateTests(unittest.TestCase):
         expected_models = ["gpt-image-2", "gpt-5.4", "custom-model"]
         self.assertEqual(public_cfg["sub2api_models"], expected_models)
         self.assertEqual(internal_cfg["sub2api_models"], expected_models)
+        self.assertEqual(public_cfg["sub2api_fingerprint_mode"], "device")
+        self.assertEqual(internal_cfg["sub2api_fingerprint_mode"], "device")
 
     def tearDown(self):
         con = getattr(db._db_local, "connection", None)
