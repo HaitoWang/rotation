@@ -15,6 +15,7 @@ import {
   removeTeamMember,
   resumeTeamRotation,
   startTeamRotation,
+  syncTeamMotherSeats,
   stopTeamRotation,
   updateTeamMother,
 } from '@/api/team'
@@ -238,6 +239,10 @@ async function toggleMother(row, enabled) {
   }
 }
 
+function syncSeats(row) {
+  runAction(`sync-seats-${row.id}`, () => syncTeamMotherSeats(row.id), `${row.name} 席位已同步`)
+}
+
 async function removeMother(row) {
   try {
     await ElMessageBox.confirm(`删除母号 ${row.name}？`, '删除母号', {
@@ -378,6 +383,7 @@ onBeforeUnmount(() => window.clearInterval(pollTimer))
         </el-table-column>
         <el-table-column label="操作" width="150" fixed="right">
           <template #default="{ row }">
+            <el-tooltip content="同步席位"><el-button text circle :icon="Refresh" :loading="actionLoading === `sync-seats-${row.id}`" @click="syncSeats(row)" /></el-tooltip>
             <el-tooltip content="查看成员"><el-button text circle :icon="View" @click="inspectMother(row)" /></el-tooltip>
             <el-tooltip content="编辑母号"><el-button text circle :icon="Edit" @click="openEdit(row)" /></el-tooltip>
             <el-tooltip content="删除母号"><el-button text circle type="danger" :icon="Delete" @click="removeMother(row)" /></el-tooltip>

@@ -1461,6 +1461,14 @@ def api_team_rotation_check_now():
     return result
 
 
+@app.post("/api/team/mothers/{mother_id}/sync-seats")
+def api_sync_team_mother_seats(mother_id: str):
+    try:
+        return TEAM_ROTATION.sync_mother_seats(mother_id)
+    except TeamApiError as exc:
+        raise HTTPException(502, str(exc)) from exc
+
+
 # ──────────────────────── 静态资源 ────────────────────────
 
 
