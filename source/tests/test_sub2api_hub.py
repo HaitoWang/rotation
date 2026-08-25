@@ -9,6 +9,7 @@ from unittest import mock
 
 from webui import db, exporter, registrar
 from webui.team_rotation import (
+    TeamApiError,
     TeamChildAuthInvalidError,
     TeamRotationController,
     TeamService,
@@ -164,6 +165,73 @@ class Sub2ApiHubPayloadTests(unittest.TestCase):
             )
 
         self.assertNotEqual(before["idempotency_key"], after["idempotency_key"])
+
+    def test_existing_hub_account_is_updated_instead_of_created(self):
+        update_response = mock.Mock(status_code=200, text="")
+        recovery_response = mock.Mock(status_code=200, text="")
+        cffi = mock.Mock()
+        cffi.put.return_value = update_response
+        cffi.post.return_value = recovery_response
+        cfg = {
+            "sub2api_url": "https://hub.example.com",
+            "sub2api_api_key": "admin-key",
+            "sub2api_group_ids": "12",
+        }
+        cred = {
+            "email": "user@example.com",
+            "access_token": self.access_token,
+            "account_id": "team-workspace",
+            "plan_type": "team",
+        }
+
+        with mock.patch.object(exporter, "_import_cffi", return_value=cffi):
+            result = exporter.export_to_sub2api(
+                cred, cfg, existing_account_id="101"
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["updated"])
+        self.assertEqual(result["account_id"], "101")
+        self.assertEqual(
+            cffi.put.call_args.args[0],
+            "https://hub.example.com/api/v1/admin/accounts/101",
+        )
+        self.assertEqual(
+            cffi.put.call_args.kwargs["json"]["credentials"]["plan_type"],
+            "team",
+        )
+        self.assertEqual(cffi.post.call_count, 2)
+        self.assertFalse(any(
+            call.args[0].endswith("/accounts/batch")
+            for call in cffi.post.call_args_list
+        ))
+
+    def test_missing_existing_hub_account_falls_back_to_batch_create(self):
+        missing_response = mock.Mock(status_code=404, text="not found")
+        create_response = mock.Mock(status_code=201, text="")
+        create_response.json.return_value = {
+            "data": {"results": [{"success": True, "id": 202}]}
+        }
+        cffi = mock.Mock()
+        cffi.put.return_value = missing_response
+        cffi.post.return_value = create_response
+        cfg = {
+            "sub2api_url": "https://hub.example.com",
+            "sub2api_api_key": "admin-key",
+            "sub2api_group_ids": "12",
+        }
+
+        with mock.patch.object(exporter, "_import_cffi", return_value=cffi):
+            result = exporter.export_to_sub2api({
+                "email": "user@example.com",
+                "access_token": self.access_token,
+                "account_id": "team-workspace",
+                "plan_type": "team",
+            }, cfg, existing_account_id="101")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["account_id"], "202")
+        self.assertTrue(cffi.post.call_args.args[0].endswith("/accounts/batch"))
 
     def test_fingerprint_mode_uses_a_new_idempotency_key(self):
         response = mock.Mock(status_code=201)
@@ -465,6 +533,7 @@ class TeamRotationHubStateTests(unittest.TestCase):
         pushed_cred = run_exports.call_args.args[0]
         self.assertEqual(pushed_cred["account_id"], "team-workspace")
         self.assertEqual(pushed_cred["plan_type"], "team")
+        self.assertIsNone(run_exports.call_args.kwargs["sub2api_account_id"])
         updated = db.find_team_rotation_member(
             self.mother["id"], "child@example.com"
         )
@@ -484,6 +553,27 @@ class TeamRotationHubStateTests(unittest.TestCase):
         ):
             controller._push_assignment_to_hub(self.mother, assignment)
 
+        updated = db.find_team_rotation_member(
+            self.mother["id"], "child@example.com"
+        )
+        self.assertEqual(updated["hub_account_id"], "101")
+
+    def test_hub_push_reuses_persisted_account_id(self):
+        db.update_team_rotation_member(
+            self.assignment["id"], hub_account_id="101", hub_status="pending"
+        )
+        assignment = db.find_team_rotation_member(
+            self.mother["id"], "child@example.com"
+        )
+        controller = TeamRotationController(service_factory=mock.Mock())
+        with mock.patch.object(
+            exporter,
+            "run_exports",
+            return_value={"sub2api": {"ok": True, "account_id": "101", "updated": True}},
+        ) as run_exports:
+            controller._push_assignment_to_hub(self.mother, assignment)
+
+        self.assertEqual(run_exports.call_args.kwargs["sub2api_account_id"], "101")
         updated = db.find_team_rotation_member(
             self.mother["id"], "child@example.com"
         )
@@ -892,6 +982,26 @@ class TeamRotationHubStateTests(unittest.TestCase):
                             "access_token": "invalid-access",
                         },
                     )
+
+    def test_join_is_not_confirmed_when_member_list_never_contains_child(self):
+        service = TeamService()
+        child = service._credentials_from_registered({
+            "email": "missing@example.com",
+            "access_token": "child-access",
+            "user_id": "personal-user-id",
+        })
+        try:
+            with mock.patch.object(
+                service,
+                "get_team_members",
+                return_value={"members": [], "total_members": 0},
+            ), mock.patch("webui.team_rotation.time.sleep"):
+                with self.assertRaisesRegex(
+                    TeamApiError, "Team 成员列表中未找到 missing@example.com"
+                ):
+                    service._confirm_joined_member(self.mother, child)
+        finally:
+            service.close()
 
     def test_auto_accept_mode_enables_once_then_only_requests_join(self):
         db.update_team_mother(self.mother["id"], {

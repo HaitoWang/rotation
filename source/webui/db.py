@@ -1655,7 +1655,7 @@ def claim_team_rotation_candidate(mother_id: str) -> Optional[dict]:
                     "secondary_used_percent=NULL, joined_at=NULL, "
                     "last_checked_at=NULL, removed_at=NULL, error='', "
                     "hub_status='pending', hub_pushed_at=NULL, "
-                    "hub_last_attempt_at=NULL, hub_error='', hub_account_id=NULL, "
+                    "hub_last_attempt_at=NULL, hub_error='', "
                     "reauth_failure_count=0, "
                     "created_at=?, updated_at=? WHERE id=?",
                     (mother_id, now, now, int(assignment_id)),
