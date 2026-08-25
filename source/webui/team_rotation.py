@@ -322,6 +322,10 @@ class TeamApiClient:
         referer: str = "/",
         json_body: Any = None,
         empty_body: bool = False,
+        json_content_type: bool = False,
+        include_cookies: bool = True,
+        include_device_id: bool = True,
+        include_session_id: bool = True,
         retries: int = 2,
     ) -> tuple[int, Any]:
         headers = {
@@ -333,15 +337,15 @@ class TeamApiClient:
         }
         if credentials.access_token:
             headers["Authorization"] = f"Bearer {credentials.access_token}"
-        if credentials.cookie_header:
+        if include_cookies and credentials.cookie_header:
             headers["Cookie"] = credentials.cookie_header
         if account_id:
             headers["chatgpt-account-id"] = account_id
-        if credentials.device_id:
+        if include_device_id and credentials.device_id:
             headers["oai-device-id"] = credentials.device_id
-        if credentials.session_id:
+        if include_session_id and credentials.session_id:
             headers["oai-session-id"] = credentials.session_id
-        if json_body is not None:
+        if json_body is not None or json_content_type:
             headers["Content-Type"] = "application/json"
 
         kwargs: dict[str, Any] = {"headers": headers, "timeout": 30}
@@ -599,11 +603,16 @@ class TeamService:
         }
 
     def invite_and_accept(self, mother: dict, account: dict) -> dict:
-        workspace_id = str(mother.get("workspace_id") or "")
         child = self._credentials_from_registered(account)
         self._resolve_access_token(child, "子号")
         if not child.email:
             raise TeamApiError("子号缺少邮箱")
+        if str(mother.get("join_mode") or "") == "auto_accept_request":
+            return self._auto_accept_request_join(mother, child)
+        return self._invite_accept_join(mother, child)
+
+    def _invite_accept_join(self, mother: dict, child: Credentials) -> dict:
+        workspace_id = str(mother.get("workspace_id") or "")
         status, payload = self._mother_request(
             mother,
             "POST",
@@ -626,9 +635,45 @@ class TeamService:
             f"/backend-api/accounts/{quote(workspace_id, safe='')}/invites/accept",
             child,
             account_id=child.account_id,
+            include_cookies=False,
+            include_session_id=False,
             empty_body=True,
             retries=2,
         )
+        self._require_child_join(status, payload, "子号接受邀请")
+        return self._confirm_joined_member(mother, child)
+
+    def _auto_accept_request_join(self, mother: dict, child: Credentials) -> dict:
+        workspace_id = str(mother.get("workspace_id") or "")
+        if not mother.get("auto_accept_configured"):
+            status, payload = self._mother_request(
+                mother,
+                "POST",
+                f"/backend-api/accounts/{quote(workspace_id, safe='')}/settings/auto_accept_requests",
+                account_id=workspace_id,
+                referer="/admin/identity",
+                json_body={"value": True},
+            )
+            self._require(status, payload, "母号开启无需审核")
+            if not db.mark_team_mother_auto_accept_configured(str(mother.get("id") or "")):
+                raise TeamApiError("母号加入方式已变化，未保存无需审核状态")
+            mother["auto_accept_configured"] = True
+
+        status, payload = self.client.request(
+            "POST",
+            f"/backend-api/accounts/{quote(workspace_id, safe='')}/invites/request",
+            child,
+            include_cookies=False,
+            include_session_id=False,
+            empty_body=True,
+            json_content_type=True,
+            retries=2,
+        )
+        self._require_child_join(status, payload, "子号申请加入")
+        return self._confirm_joined_member(mother, child)
+
+    @staticmethod
+    def _require_child_join(status: int, payload: Any, action: str) -> None:
         payload_preview = (
             json.dumps(payload, ensure_ascii=False)
             if isinstance(payload, (dict, list))
@@ -643,10 +688,11 @@ class TeamService:
         )
         if auth_invalid:
             raise TeamChildAuthInvalidError(
-                f"子号接受邀请失败: HTTP {status}, {payload_preview[:500]}"
+                f"{action}失败: HTTP {status}, {payload_preview[:500]}"
             )
-        self._require(status, payload, "子号接受邀请")
+        TeamService._require(status, payload, action)
 
+    def _confirm_joined_member(self, mother: dict, child: Credentials) -> dict:
         member_id = child.user_id
         for attempt in range(3):
             detail = self.get_team_members(mother)
@@ -1322,14 +1368,28 @@ class TeamRotationController:
                     joined_at=time.time(),
                     error="",
                 )
-                join_message = "轮出子号已加入新 Team" if claim.get("recycled") else "子号已加入 Team"
+                join_mode_label = (
+                    "无需审核"
+                    if mother.get("join_mode") == "auto_accept_request"
+                    else "主动邀请"
+                )
+                join_message = (
+                    "轮出子号已加入新 Team"
+                    if claim.get("recycled")
+                    else "子号已加入 Team"
+                ) + f"（{join_mode_label}）"
                 self._event("INFO", "join", join_message, mother_id, claim["email"])
                 remaining -= 1
                 joined_count += 1
                 candidate_available = db.has_team_rotation_candidate(mother_id)
 
             if remaining > 0 and not candidate_available and (force_team_refresh or removed_count):
-                self._event("WARNING", "pool", "账号池已无可用完整凭证账号", mother_id)
+                pool_message = "账号池已无可用完整凭证账号"
+                if mother.get("join_mode") == "auto_accept_request":
+                    mother_email = str(mother.get("email") or "").lower()
+                    domain = mother_email.rsplit("@", 1)[1] if "@" in mother_email else "未知"
+                    pool_message = f"账号池没有与母号后缀 @{domain} 匹配的可用完整凭证账号"
+                self._event("WARNING", "pool", pool_message, mother_id)
 
             if joined_count:
                 seats["remaining_default"] = remaining

@@ -16,7 +16,7 @@ import sqlite3
 import sys
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 from urllib.parse import quote
 
 from fastapi import FastAPI, HTTPException, Request
@@ -1318,6 +1318,7 @@ class TeamMotherCreateReq(BaseModel):
     session: str = Field(..., min_length=1, description="Session JSON、Access Token 或 Cookie")
     workspace_id: str = Field("", max_length=200)
     enabled: bool = True
+    join_mode: Literal["invite_accept", "auto_accept_request"] = "invite_accept"
 
 
 class TeamMotherUpdateReq(BaseModel):
@@ -1325,6 +1326,7 @@ class TeamMotherUpdateReq(BaseModel):
     session: Optional[str] = Field(None, description="留空表示不修改凭证")
     workspace_id: Optional[str] = Field(None, max_length=200)
     enabled: Optional[bool] = None
+    join_mode: Optional[Literal["invite_accept", "auto_accept_request"]] = None
 
 
 class TeamRotationStartReq(BaseModel):
@@ -1344,10 +1346,13 @@ def api_team_mothers():
 def api_create_team_mother(req: TeamMotherCreateReq):
     try:
         material = parse_mother_session(req.session, req.workspace_id)
+        if req.join_mode == "auto_accept_request" and not material.get("email"):
+            raise ValueError("无需审核模式必须能从母号 Session 识别邮箱")
         item = db.create_team_mother({
             **material,
             "name": req.name.strip(),
             "enabled": req.enabled,
+            "join_mode": req.join_mode,
         })
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
@@ -1371,6 +1376,12 @@ def api_update_team_mother(mother_id: str, req: TeamMotherUpdateReq):
             raise HTTPException(400, str(exc)) from exc
     if "name" in changes:
         changes["name"] = str(changes["name"]).strip()
+    selected_mode = changes.get("join_mode", existing.get("join_mode") or "invite_accept")
+    selected_email = changes.get("email", existing.get("email") or "")
+    if selected_mode == "auto_accept_request" and not selected_email:
+        raise HTTPException(400, "无需审核模式必须能从母号 Session 识别邮箱")
+    if "join_mode" in changes and changes["join_mode"] != existing.get("join_mode"):
+        changes["auto_accept_configured"] = False
     try:
         item = db.update_team_mother(mother_id, changes)
     except sqlite3.IntegrityError as exc:

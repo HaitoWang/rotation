@@ -113,6 +113,10 @@ function hubStatusTag(value) {
   }[value] || [value || '待推送', 'warning']
 }
 
+function joinModeLabel(value) {
+  return value === 'auto_accept_request' ? '无需审核' : '主动邀请'
+}
+
 async function loadStatus(silent = false) {
   if (!silent) loading.value = true
   try {
@@ -173,11 +177,11 @@ function checkNow() {
 const motherDialog = ref(false)
 const motherSaving = ref(false)
 const editingId = ref('')
-const motherForm = reactive({ name: '', workspace_id: '', session: '', enabled: true })
+const motherForm = reactive({ name: '', workspace_id: '', session: '', enabled: true, join_mode: 'invite_accept' })
 
 function openCreate() {
   editingId.value = ''
-  Object.assign(motherForm, { name: '', workspace_id: '', session: '', enabled: true })
+  Object.assign(motherForm, { name: '', workspace_id: '', session: '', enabled: true, join_mode: 'invite_accept' })
   motherDialog.value = true
 }
 
@@ -188,6 +192,7 @@ function openEdit(row) {
     workspace_id: row.workspace_id,
     session: '',
     enabled: row.enabled,
+    join_mode: row.join_mode || 'invite_accept',
   })
   motherDialog.value = true
 }
@@ -207,6 +212,7 @@ async function saveMother() {
       name: motherForm.name.trim(),
       workspace_id: motherForm.workspace_id.trim(),
       enabled: motherForm.enabled,
+      join_mode: motherForm.join_mode,
     }
     if (motherForm.session.trim()) payload.session = motherForm.session.trim()
     if (editingId.value) await updateTeamMother(editingId.value, payload)
@@ -349,6 +355,13 @@ onBeforeUnmount(() => window.clearInterval(pollTimer))
           </template>
         </el-table-column>
         <el-table-column prop="workspace_id" label="Workspace ID" min-width="220" show-overflow-tooltip />
+        <el-table-column label="加入方式" width="110">
+          <template #default="{ row }">
+            <el-tag :type="row.join_mode === 'auto_accept_request' ? 'warning' : 'info'" effect="light">
+              {{ joinModeLabel(row.join_mode) }}
+            </el-tag>
+          </template>
+        </el-table-column>
         <el-table-column label="席位" width="150">
           <template #default="{ row }">
             <span v-if="row.seats_entitled !== null && row.seats_entitled !== undefined">
@@ -434,6 +447,12 @@ onBeforeUnmount(() => window.clearInterval(pollTimer))
         </div>
         <el-form-item :label="editingId ? 'Session / Access Token（留空不修改）' : 'Session / Access Token'">
           <el-input v-model="motherForm.session" type="textarea" :rows="7" resize="vertical" />
+        </el-form-item>
+        <el-form-item label="子号加入方式">
+          <el-radio-group v-model="motherForm.join_mode">
+            <el-radio-button value="invite_accept">主动邀请</el-radio-button>
+            <el-radio-button value="auto_accept_request">无需审核</el-radio-button>
+          </el-radio-group>
         </el-form-item>
         <el-form-item label="启用"><el-switch v-model="motherForm.enabled" /></el-form-item>
       </el-form>

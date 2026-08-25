@@ -213,6 +213,8 @@ def init_db():
             cookie_header     TEXT,
             owner_user_id     TEXT,
             enabled           INTEGER NOT NULL DEFAULT 1,
+            join_mode         TEXT NOT NULL DEFAULT 'invite_accept',
+            auto_accept_configured INTEGER NOT NULL DEFAULT 0,
             seats_entitled    INTEGER,
             seats_in_use      INTEGER,
             seats_remaining   INTEGER,
@@ -326,6 +328,19 @@ def init_db():
         con.execute(
             "ALTER TABLE team_rotation_members "
             "ADD COLUMN reauth_failure_count INTEGER NOT NULL DEFAULT 0"
+        )
+
+    cur = con.execute("PRAGMA table_info(team_mothers)")
+    mother_cols = {r[1] for r in cur.fetchall()}
+    if "join_mode" not in mother_cols:
+        con.execute(
+            "ALTER TABLE team_mothers "
+            "ADD COLUMN join_mode TEXT NOT NULL DEFAULT 'invite_accept'"
+        )
+    if "auto_accept_configured" not in mother_cols:
+        con.execute(
+            "ALTER TABLE team_mothers "
+            "ADD COLUMN auto_accept_configured INTEGER NOT NULL DEFAULT 0"
         )
     con.commit()
     con.close()
@@ -1222,8 +1237,9 @@ def create_team_mother(data: dict) -> dict:
             con.execute(
                 "INSERT INTO team_mothers "
                 "(id, name, email, workspace_id, access_token, cookie_header, "
-                "owner_user_id, enabled, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "owner_user_id, enabled, join_mode, auto_accept_configured, "
+                "created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     mother_id,
                     str(data.get("name") or "").strip(),
@@ -1233,6 +1249,12 @@ def create_team_mother(data: dict) -> dict:
                     str(data.get("cookie_header") or "").strip(),
                     str(data.get("owner_user_id") or "").strip(),
                     1 if data.get("enabled", True) else 0,
+                    (
+                        "auto_accept_request"
+                        if data.get("join_mode") == "auto_accept_request"
+                        else "invite_accept"
+                    ),
+                    1 if data.get("auto_accept_configured") else 0,
                     now,
                     now,
                 ),
@@ -1246,7 +1268,7 @@ def create_team_mother(data: dict) -> dict:
 def update_team_mother(mother_id: str, data: dict) -> Optional[dict]:
     allowed = {
         "name", "email", "workspace_id", "access_token", "cookie_header",
-        "owner_user_id", "enabled",
+        "owner_user_id", "enabled", "join_mode", "auto_accept_configured",
     }
     sets = []
     values = []
@@ -1254,8 +1276,14 @@ def update_team_mother(mother_id: str, data: dict) -> Optional[dict]:
         if key not in allowed:
             continue
         sets.append(f"{key}=?")
-        if key == "enabled":
+        if key in {"enabled", "auto_accept_configured"}:
             values.append(1 if value else 0)
+        elif key == "join_mode":
+            values.append(
+                "auto_accept_request"
+                if value == "auto_accept_request"
+                else "invite_accept"
+            )
         elif key == "email":
             values.append(str(value or "").strip().lower())
         else:
@@ -1290,6 +1318,7 @@ def get_team_mother(mother_id: str, include_secret: bool = True) -> Optional[dic
         return None
     out = dict(row)
     out["enabled"] = bool(out.get("enabled"))
+    out["auto_accept_configured"] = bool(out.get("auto_accept_configured"))
     if not include_secret:
         out["has_access_token"] = bool(out.get("access_token"))
         out["has_cookie"] = bool(out.get("cookie_header"))
@@ -1311,6 +1340,7 @@ def list_team_mothers(include_secret: bool = False, enabled_only: bool = False) 
     for row in rows:
         item = dict(row)
         item["enabled"] = bool(item.get("enabled"))
+        item["auto_accept_configured"] = bool(item.get("auto_accept_configured"))
         if not include_secret:
             item["has_access_token"] = bool(item.get("access_token"))
             item["has_cookie"] = bool(item.get("cookie_header"))
@@ -1361,14 +1391,49 @@ def record_team_mother_check(
             con.close()
 
 
+def mark_team_mother_auto_accept_configured(mother_id: str) -> bool:
+    with _lock:
+        con = _conn()
+        try:
+            cur = con.execute(
+                "UPDATE team_mothers SET auto_accept_configured=1, updated_at=? "
+                "WHERE id=? AND join_mode='auto_accept_request'",
+                (time.time(), mother_id),
+            )
+            con.commit()
+            return cur.rowcount > 0
+        finally:
+            con.close()
+
+
+def _team_candidate_domain(mother_id: str) -> str:
+    con = _conn()
+    try:
+        row = con.execute(
+            "SELECT email, join_mode FROM team_mothers WHERE id=?",
+            (mother_id,),
+        ).fetchone()
+    finally:
+        con.close()
+    if not row or str(row["join_mode"] or "") != "auto_accept_request":
+        return ""
+    email = str(row["email"] or "").strip().lower()
+    return email.rsplit("@", 1)[1] if "@" in email else "__missing_mother_domain__"
+
+
 def claim_team_rotation_candidate(mother_id: str) -> Optional[dict]:
     """Atomically reserve a fresh account or recycle one from another mother."""
     now = time.time()
+    required_domain = _team_candidate_domain(mother_id)
     with _lock:
         con = _conn()
         try:
             con.execute("BEGIN IMMEDIATE")
-            row = con.execute(
+            domain_clause = (
+                "AND lower(substr(r.email, instr(r.email, '@') + 1))=? "
+                if required_domain else ""
+            )
+            query = (
                 "SELECT r.email, tm.id AS assignment_id, "
                 "tm.mother_id AS previous_mother_id "
                 "FROM registered AS r "
@@ -1381,13 +1446,15 @@ def claim_team_rotation_candidate(mother_id: str) -> Optional[dict]:
                 "AND length(trim(coalesce(r.session_token, '')))>0 "
                 "AND length(trim(coalesce(r.refresh_token, '')))>0 "
                 "AND (o.email IS NULL OR o.status='done') "
+                f"{domain_clause}"
                 "AND (tm.id IS NULL OR ("
                 "  tm.status IN ('exhausted','removed') AND tm.mother_id<>?"
                 ")) "
                 "ORDER BY CASE WHEN tm.id IS NULL THEN 0 ELSE 1 END, "
-                "r.created_at ASC LIMIT 1",
-                (mother_id,),
-            ).fetchone()
+                "r.created_at ASC LIMIT 1"
+            )
+            params = (required_domain, mother_id) if required_domain else (mother_id,)
+            row = con.execute(query, params).fetchone()
             if not row:
                 con.rollback()
                 return None
@@ -1441,9 +1508,14 @@ def claim_team_rotation_candidate(mother_id: str) -> Optional[dict]:
 
 def has_team_rotation_candidate(mother_id: str) -> bool:
     """Return whether this mother can claim a fresh or recycled account."""
+    required_domain = _team_candidate_domain(mother_id)
     con = _conn()
     try:
-        row = con.execute(
+        domain_clause = (
+            "AND lower(substr(r.email, instr(r.email, '@') + 1))=? "
+            if required_domain else ""
+        )
+        query = (
             "SELECT 1 FROM registered AS r "
             "LEFT JOIN outlook_accounts AS o "
             "ON lower(o.email)=lower(r.email) "
@@ -1454,11 +1526,13 @@ def has_team_rotation_candidate(mother_id: str) -> bool:
             "AND length(trim(coalesce(r.session_token, '')))>0 "
             "AND length(trim(coalesce(r.refresh_token, '')))>0 "
             "AND (o.email IS NULL OR o.status='done') "
+            f"{domain_clause}"
             "AND (tm.id IS NULL OR ("
             "  tm.status IN ('exhausted','removed') AND tm.mother_id<>?"
-            ")) LIMIT 1",
-            (mother_id,),
-        ).fetchone()
+            ")) LIMIT 1"
+        )
+        params = (required_domain, mother_id) if required_domain else (mother_id,)
+        row = con.execute(query, params).fetchone()
         return row is not None
     finally:
         con.close()

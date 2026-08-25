@@ -703,6 +703,86 @@ class TeamRotationHubStateTests(unittest.TestCase):
                         },
                     )
 
+    def test_auto_accept_mode_enables_once_then_only_requests_join(self):
+        db.update_team_mother(self.mother["id"], {
+            "email": "owner@example.com",
+            "join_mode": "auto_accept_request",
+            "auto_accept_configured": False,
+        })
+        mother = db.get_team_mother(self.mother["id"], include_secret=True)
+        service = TeamService()
+        try:
+            with mock.patch.object(
+                service,
+                "_mother_request",
+                return_value=(200, {"success": True}),
+            ) as mother_request, mock.patch.object(
+                service.client,
+                "request",
+                return_value=(200, {"success": True}),
+            ) as child_request, mock.patch.object(
+                service,
+                "_confirm_joined_member",
+                side_effect=lambda _mother, child: {
+                    "member_id": child.user_id or child.email,
+                    "email": child.email,
+                },
+            ):
+                first = service.invite_and_accept(mother, {
+                    "email": "first@example.com",
+                    "access_token": "first-access",
+                    "user_id": "first-user",
+                })
+                second = service.invite_and_accept(mother, {
+                    "email": "second@example.com",
+                    "access_token": "second-access",
+                    "user_id": "second-user",
+                })
+
+            self.assertEqual(first["member_id"], "first-user")
+            self.assertEqual(second["member_id"], "second-user")
+            mother_request.assert_called_once()
+            self.assertTrue(
+                mother_request.call_args.args[2].endswith(
+                    "/settings/auto_accept_requests"
+                )
+            )
+            self.assertEqual(mother_request.call_args.kwargs["json_body"], {"value": True})
+            self.assertEqual(child_request.call_count, 2)
+            for call in child_request.call_args_list:
+                self.assertTrue(call.args[1].endswith("/invites/request"))
+                self.assertNotIn("account_id", call.kwargs)
+                self.assertFalse(call.kwargs["include_cookies"])
+                self.assertFalse(call.kwargs["include_session_id"])
+                self.assertTrue(call.kwargs["json_content_type"])
+            updated = db.get_team_mother(self.mother["id"])
+            self.assertTrue(updated["auto_accept_configured"])
+        finally:
+            service.close()
+
+    def test_auto_accept_mother_only_claims_matching_email_domain(self):
+        db.update_team_mother(self.mother["id"], {
+            "email": "owner@icloud.com",
+            "join_mode": "auto_accept_request",
+        })
+        db.save_registered({
+            "email": "older@gmail.com",
+            "access_token": "gmail-access",
+            "session_token": "gmail-session",
+            "refresh_token": "gmail-refresh",
+        })
+        db.save_registered({
+            "email": "matching@icloud.com",
+            "access_token": "icloud-access",
+            "session_token": "icloud-session",
+            "refresh_token": "icloud-refresh",
+        })
+
+        claim = db.claim_team_rotation_candidate(self.mother["id"])
+
+        self.assertIsNotNone(claim)
+        self.assertEqual(claim["email"], "matching@icloud.com")
+
     def test_quota_refreshes_codex_token_before_usage_check(self):
         service = TeamService()
         try:
