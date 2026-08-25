@@ -292,8 +292,51 @@ class Sub2ApiHubPayloadTests(unittest.TestCase):
                 "sub2api_api_key": "admin-key",
             }, 101)
 
-        self.assertEqual(result["classification"], "rate_limited")
+        self.assertEqual(result["classification"], "short_rate_limited")
         self.assertIn("/api/v1/admin/accounts/101", cffi.get.call_args.args[0])
+
+    def test_account_status_distinguishes_5h_and_7d_windows(self):
+        response = mock.Mock(status_code=200)
+        response.json.side_effect = [
+            {
+                "code": 0,
+                "data": {
+                    "id": 101,
+                    "status": "active",
+                    "schedulable": False,
+                    "extra": {
+                        "codex_5h_used_percent": 100,
+                        "codex_5h_reset_at": "2099-01-01T01:00:00Z",
+                        "codex_7d_used_percent": 12,
+                    },
+                },
+            },
+            {
+                "code": 0,
+                "data": {
+                    "id": 102,
+                    "status": "active",
+                    "schedulable": False,
+                    "extra": {
+                        "codex_5h_used_percent": 100,
+                        "codex_7d_used_percent": 100,
+                    },
+                },
+            },
+        ]
+        cffi = mock.Mock()
+        cffi.get.return_value = response
+        cfg = {
+            "sub2api_url": "https://hub.example.com",
+            "sub2api_api_key": "admin-key",
+        }
+
+        with mock.patch.object(exporter, "_import_cffi", return_value=cffi):
+            five_hour = exporter.get_sub2api_account_status(cfg, 101)
+            seven_day = exporter.get_sub2api_account_status(cfg, 102)
+
+        self.assertEqual(five_hour["classification"], "short_rate_limited")
+        self.assertEqual(seven_day["classification"], "weekly_exhausted")
 
     def test_account_status_classifies_error_for_reauthorization(self):
         response = mock.Mock(status_code=200)
@@ -446,7 +489,7 @@ class TeamRotationHubStateTests(unittest.TestCase):
         )
         self.assertEqual(updated["hub_account_id"], "101")
 
-    def test_hub_rate_limited_member_is_removed_without_balance_probe(self):
+    def test_hub_5h_limited_member_is_removed_with_temporary_cooldown(self):
         assignment = db.find_team_rotation_member(
             self.mother["id"], "child@example.com"
         )
@@ -467,7 +510,11 @@ class TeamRotationHubStateTests(unittest.TestCase):
         with mock.patch.object(
             exporter,
             "get_sub2api_account_status",
-            return_value={"classification": "rate_limited", "error": "账号限流"},
+            return_value={
+                "classification": "short_rate_limited",
+                "error": "账号 5h 限流",
+                "reset_at": time.time() + 3600,
+            },
         ):
             controller._process_mother(self.mother)
 
@@ -476,7 +523,42 @@ class TeamRotationHubStateTests(unittest.TestCase):
         updated = db.find_team_rotation_member(
             self.mother["id"], "child@example.com"
         )
+        self.assertEqual(updated["status"], "cooldown")
+        history = db.list_team_rotation_member_history("child@example.com")
+        self.assertFalse(history[0]["permanently_excluded"])
+        self.assertGreater(history[0]["cooldown_until"], time.time())
+
+    def test_hub_7d_exhausted_member_is_permanently_excluded_for_mother(self):
+        assignment = db.find_team_rotation_member(
+            self.mother["id"], "child@example.com"
+        )
+        db.update_team_rotation_member(
+            assignment["id"], status="active", member_id="member-1",
+            hub_status="success", hub_account_id="101",
+        )
+        service = mock.Mock()
+        service.get_team_detail.return_value = {
+            "seats": {"entitled": 1, "in_use": 1, "remaining_default": 0},
+            "members": [{"id": "member-1", "email": "child@example.com"}],
+        }
+        service.remove_member.return_value = {"removed": True}
+        controller = TeamRotationController(
+            service_factory=mock.Mock(return_value=service)
+        )
+        with mock.patch.object(
+            exporter,
+            "get_sub2api_account_status",
+            return_value={"classification": "weekly_exhausted", "error": "账号 7d 耗尽"},
+        ):
+            controller._process_mother(self.mother)
+
+        updated = db.find_team_rotation_member(
+            self.mother["id"], "child@example.com"
+        )
         self.assertEqual(updated["status"], "exhausted")
+        history = db.list_team_rotation_member_history("child@example.com")
+        self.assertTrue(history[0]["permanently_excluded"])
+        self.assertFalse(db.has_team_rotation_candidate(self.mother["id"]))
 
     def test_inactive_hub_member_is_removed_and_seat_is_released(self):
         assignment = db.find_team_rotation_member(
@@ -512,7 +594,7 @@ class TeamRotationHubStateTests(unittest.TestCase):
         updated = db.find_team_rotation_member(
             self.mother["id"], "child@example.com"
         )
-        self.assertEqual(updated["status"], "removed")
+        self.assertEqual(updated["status"], "cooldown")
         updated_mother = db.get_team_mother(self.mother["id"])
         self.assertEqual(updated_mother["seats_remaining"], 2)
         self.assertEqual(updated_mother["seats_in_use"], 0)
@@ -557,6 +639,13 @@ class TeamRotationHubStateTests(unittest.TestCase):
             hub_last_attempt_at=140.0,
             hub_error="old error",
         )
+        db.record_team_rotation_removal(
+            "child@example.com",
+            self.mother["id"],
+            reason="7d exhausted",
+            removed_at=300.0,
+            permanently_excluded=True,
+        )
 
         self.assertFalse(db.has_team_rotation_candidate(self.mother["id"]))
         self.assertIsNone(db.claim_team_rotation_candidate(self.mother["id"]))
@@ -598,7 +687,8 @@ class TeamRotationHubStateTests(unittest.TestCase):
             self.assignment["id"], status="removed", removed_at=200.0
         )
         db.record_team_rotation_removal(
-            "child@example.com", self.mother["id"], reason="first mother exhausted", removed_at=200.0
+            "child@example.com", self.mother["id"], reason="7d exhausted",
+            removed_at=200.0, permanently_excluded=True,
         )
 
         claim_b = db.claim_team_rotation_candidate(mother_b["id"])
@@ -607,7 +697,8 @@ class TeamRotationHubStateTests(unittest.TestCase):
         db.update_team_rotation_member(claim_b["id"], status="removed", removed_at=300.0)
         db.record_team_rotation_join("child@example.com", mother_b["id"], joined_at=250.0)
         db.record_team_rotation_removal(
-            "child@example.com", mother_b["id"], reason="second mother exhausted", removed_at=300.0
+            "child@example.com", mother_b["id"], reason="7d exhausted",
+            removed_at=300.0, permanently_excluded=True,
         )
 
         self.assertFalse(db.has_team_rotation_candidate(self.mother["id"]))
@@ -616,6 +707,34 @@ class TeamRotationHubStateTests(unittest.TestCase):
             [item["mother_id"] for item in db.list_team_rotation_member_history("child@example.com")],
             [self.mother["id"], mother_b["id"]],
         )
+
+    def test_5h_cooldown_blocks_same_mother_until_reset_only(self):
+        mother_b = db.create_team_mother({
+            "name": "Team B Cooldown",
+            "workspace_id": "team-workspace-b-cooldown",
+            "access_token": "mother-b-access-token",
+            "enabled": True,
+        })
+        db.update_team_rotation_member(
+            self.assignment["id"], status="cooldown", removed_at=time.time()
+        )
+        db.record_team_rotation_removal(
+            "child@example.com",
+            self.mother["id"],
+            reason="5h rate limit",
+            cooldown_until=time.time() + 3600,
+        )
+
+        self.assertFalse(db.has_team_rotation_candidate(self.mother["id"]))
+        self.assertTrue(db.has_team_rotation_candidate(mother_b["id"]))
+
+        db.record_team_rotation_removal(
+            "child@example.com",
+            self.mother["id"],
+            reason="5h reset",
+            cooldown_until=time.time() - 1,
+        )
+        self.assertTrue(db.has_team_rotation_candidate(self.mother["id"]))
 
     def test_exhausted_account_joins_another_mother(self):
         mother_b_public = db.create_team_mother({

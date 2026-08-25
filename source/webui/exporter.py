@@ -25,6 +25,7 @@ import base64
 import hashlib
 import json
 import logging
+import math
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Optional
@@ -869,6 +870,61 @@ def _sub2api_future(value: Any, now: Optional[float] = None) -> bool:
         return False
 
 
+def _sub2api_timestamp(value: Any) -> Optional[float]:
+    if value is None or value == "":
+        return None
+    try:
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value)
+        text = str(value).strip()
+        if not text:
+            return None
+        try:
+            return float(text)
+        except ValueError:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.timestamp()
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _sub2api_number(value: Any) -> Optional[float]:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _sub2api_codex_windows(extra: Any, now: float) -> dict:
+    """Read cached 5h/7d usage captured by Sub2API from real model traffic."""
+    extra = extra if isinstance(extra, dict) else {}
+    out = {
+        "five_used": _sub2api_number(extra.get("codex_5h_used_percent")),
+        "five_reset": _sub2api_timestamp(extra.get("codex_5h_reset_at")),
+        "seven_used": _sub2api_number(extra.get("codex_7d_used_percent")),
+        "seven_reset": _sub2api_timestamp(extra.get("codex_7d_reset_at")),
+    }
+    for prefix in ("primary", "secondary"):
+        used = _sub2api_number(extra.get(f"codex_{prefix}_used_percent"))
+        window = _sub2api_number(extra.get(f"codex_{prefix}_window_minutes"))
+        reset = _sub2api_timestamp(extra.get(f"codex_{prefix}_reset_at"))
+        if reset is None:
+            after = _sub2api_number(extra.get(f"codex_{prefix}_reset_after_seconds"))
+            reset = now + max(0.0, after) if after is not None else None
+        if used is None or window is None:
+            continue
+        if window >= 1440 and out["seven_used"] is None:
+            out["seven_used"], out["seven_reset"] = used, reset
+        elif window < 1440 and out["five_used"] is None:
+            out["five_used"], out["five_reset"] = used, reset
+    return out
+
+
 def _sub2api_model_limit_active(extra: Any, now: float) -> bool:
     """兼容 extra.model_rate_limits 的不同版本结构。"""
     if not isinstance(extra, (dict, list)):
@@ -883,11 +939,13 @@ def _sub2api_model_limit_active(extra: Any, now: float) -> bool:
         if isinstance(value, (dict, list)) and _sub2api_model_limit_active(value, now):
             return True
     return False
+
+
 def get_sub2api_account_status(cfg: dict, account_id: Any) -> dict:
     """读取一个 Hub 账号的调度状态，不调用 ChatGPT 余额接口。
 
-    返回 classification：healthy、rate_limited、auth_required、error、missing
-    或 hub_error。Admin API 自身的 401/403 不会被误判为子号授权失效。
+    返回 classification：healthy、short_rate_limited、weekly_exhausted、
+    auth_required、error、missing 或 hub_error。
     """
     account_id_text = str(account_id or "").strip()
     if not account_id_text:
@@ -932,37 +990,79 @@ def get_sub2api_account_status(cfg: dict, account_id: Any) -> dict:
             "error": error_message or "Sub2API 账号处于 error 状态",
         }
 
+    extra = data.get("extra") if isinstance(data.get("extra"), dict) else {}
+    windows = _sub2api_codex_windows(extra, now)
+    visibly_limited = (
+        account_status in {"rate_limited", "limited", "overloaded", "quota_exhausted"}
+        or data.get("schedulable") is False
+        or _sub2api_future(data.get("rate_limit_reset_at"), now)
+    )
+    seven_active = windows["seven_reset"] is None or windows["seven_reset"] > now
+    five_active = windows["five_reset"] is None or windows["five_reset"] > now
+    if (
+        windows["seven_used"] is not None
+        and windows["seven_used"] >= 100
+        and seven_active
+        and visibly_limited
+    ):
+        return {
+            "ok": True,
+            "classification": "weekly_exhausted",
+            "http_status": status,
+            "account": data,
+            "reset_at": windows["seven_reset"],
+            "error": f"Sub2API 账号 7d 额度达到 {windows['seven_used']:g}%",
+        }
+    if (
+        windows["five_used"] is not None
+        and windows["five_used"] >= 100
+        and five_active
+        and visibly_limited
+    ):
+        reset_at = windows["five_reset"] or _sub2api_timestamp(data.get("rate_limit_reset_at"))
+        return {
+            "ok": True,
+            "classification": "short_rate_limited",
+            "http_status": status,
+            "account": data,
+            "reset_at": reset_at,
+            "error": f"Sub2API 账号 5h 额度达到 {windows['five_used']:g}%",
+        }
+
     if account_status in {"rate_limited", "limited", "overloaded", "quota_exhausted"}:
         return {
             "ok": True,
-            "classification": "rate_limited",
+            "classification": "short_rate_limited",
             "http_status": status,
             "account": data,
-            "error": error_message or f"Sub2API 账号状态为 {account_status}",
+            "reset_at": _sub2api_timestamp(data.get("rate_limit_reset_at")),
+            "error": error_message or f"Sub2API 账号临时限流状态为 {account_status}",
         }
 
     if _sub2api_future(data.get("rate_limit_reset_at"), now):
         return {
             "ok": True,
-            "classification": "rate_limited",
+            "classification": "short_rate_limited",
             "http_status": status,
             "account": data,
+            "reset_at": _sub2api_timestamp(data.get("rate_limit_reset_at")),
             "error": f"Sub2API 账号限流，重置时间 {data.get('rate_limit_reset_at')}",
         }
 
     if _sub2api_future(data.get("overload_until"), now):
         return {
             "ok": True,
-            "classification": "rate_limited",
+            "classification": "short_rate_limited",
             "http_status": status,
             "account": data,
+            "reset_at": _sub2api_timestamp(data.get("overload_until")),
             "error": f"Sub2API 账号处于过载冷却，结束时间 {data.get('overload_until')}",
         }
 
-    if _sub2api_model_limit_active((data.get("extra") or {}).get("model_rate_limits") if isinstance(data.get("extra"), dict) else None, now):
+    if _sub2api_model_limit_active(extra.get("model_rate_limits"), now):
         return {
             "ok": True,
-            "classification": "rate_limited",
+            "classification": "short_rate_limited",
             "http_status": status,
             "account": data,
             "error": "Sub2API 账号存在未重置的模型限流",
@@ -977,7 +1077,7 @@ def get_sub2api_account_status(cfg: dict, account_id: Any) -> dict:
         return {
             "ok": True,
             "classification": (
-                "rate_limited"
+                "short_rate_limited"
                 if any(marker in lower_reason for marker in rate_markers)
                 else "auth_required"
                 if any(marker in lower_reason for marker in auth_markers)
@@ -985,6 +1085,7 @@ def get_sub2api_account_status(cfg: dict, account_id: Any) -> dict:
             ),
             "http_status": status,
             "account": data,
+            "reset_at": _sub2api_timestamp(temp_until),
             "error": reason or "Sub2API 账号临时停调",
         }
 

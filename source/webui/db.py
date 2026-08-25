@@ -255,6 +255,8 @@ def init_db():
             mother_id   TEXT NOT NULL,
             joined_at   REAL NOT NULL,
             removed_at  REAL,
+            cooldown_until REAL,
+            permanently_excluded INTEGER NOT NULL DEFAULT 0,
             reason      TEXT,
             created_at  REAL NOT NULL,
             updated_at  REAL NOT NULL,
@@ -360,6 +362,33 @@ def init_db():
             "ALTER TABLE team_mothers "
             "ADD COLUMN auto_accept_configured INTEGER NOT NULL DEFAULT 0"
         )
+
+    cur = con.execute("PRAGMA table_info(team_rotation_member_history)")
+    history_cols = {r[1] for r in cur.fetchall()}
+    if "cooldown_until" not in history_cols:
+        con.execute(
+            "ALTER TABLE team_rotation_member_history ADD COLUMN cooldown_until REAL"
+        )
+    if "permanently_excluded" not in history_cols:
+        con.execute(
+            "ALTER TABLE team_rotation_member_history "
+            "ADD COLUMN permanently_excluded INTEGER NOT NULL DEFAULT 0"
+        )
+    con.execute(
+        "UPDATE team_rotation_member_history SET permanently_excluded=1 "
+        "WHERE permanently_excluded=0 AND ("
+        "lower(coalesce(reason, '')) LIKE '%7d%' "
+        "OR coalesce(reason, '') LIKE '%7天%'"
+        ")"
+    )
+    con.execute(
+        "UPDATE team_rotation_member_history SET cooldown_until=removed_at+18000 "
+        "WHERE permanently_excluded=0 AND cooldown_until IS NULL "
+        "AND removed_at IS NOT NULL AND ("
+        "lower(coalesce(reason, '')) LIKE '%rate_limit%' "
+        "OR coalesce(reason, '') LIKE '%限流%'"
+        ")"
+    )
 
     # 补齐历史母号使用记录。旧版只保留当前 assignment，无法恢复完整历史，
     # 但可以从成功 join 事件和现有已加入/已移出记录尽量回填，避免继续扩大循环。
@@ -1466,7 +1495,7 @@ def _team_candidate_domain(mother_id: str) -> str:
 
 
 def record_team_rotation_join(email: str, mother_id: str, joined_at: Optional[float] = None) -> bool:
-    """Record the first successful Team join for an email/mother pair."""
+    """Record a Team join and clear any expired temporary cooldown."""
     normalized_email = str(email or "").strip().lower()
     normalized_mother = str(mother_id or "").strip()
     if not normalized_email or not normalized_mother:
@@ -1476,9 +1505,14 @@ def record_team_rotation_join(email: str, mother_id: str, joined_at: Optional[fl
         con = _conn()
         try:
             cur = con.execute(
-                "INSERT OR IGNORE INTO team_rotation_member_history "
-                "(email, mother_id, joined_at, removed_at, reason, created_at, updated_at) "
-                "VALUES (?, ?, ?, NULL, '', ?, ?)",
+                "INSERT INTO team_rotation_member_history "
+                "(email, mother_id, joined_at, removed_at, cooldown_until, "
+                "permanently_excluded, reason, created_at, updated_at) "
+                "VALUES (?, ?, ?, NULL, NULL, 0, '', ?, ?) "
+                "ON CONFLICT(email, mother_id) DO UPDATE SET "
+                "joined_at=excluded.joined_at, removed_at=NULL, cooldown_until=NULL, "
+                "reason='', updated_at=excluded.updated_at "
+                "WHERE team_rotation_member_history.permanently_excluded=0",
                 (normalized_email, normalized_mother, joined_at, joined_at, joined_at),
             )
             con.commit()
@@ -1492,32 +1526,47 @@ def record_team_rotation_removal(
     mother_id: str,
     reason: str = "",
     removed_at: Optional[float] = None,
+    cooldown_until: Optional[float] = None,
+    permanently_excluded: bool = False,
 ) -> bool:
-    """Record removal while keeping the email/mother pair permanently consumed."""
+    """Record either a temporary 5h cooldown or permanent 7d exclusion."""
     normalized_email = str(email or "").strip().lower()
     normalized_mother = str(mother_id or "").strip()
     if not normalized_email or not normalized_mother:
         return False
     removed_at = float(removed_at or time.time())
+    cooldown_value = float(cooldown_until) if cooldown_until else None
     reason = str(reason or "")[:1000]
     with _lock:
         con = _conn()
         try:
             cur = con.execute(
-                "UPDATE team_rotation_member_history SET removed_at=?, reason=?, updated_at=? "
+                "UPDATE team_rotation_member_history SET removed_at=?, cooldown_until=?, "
+                "permanently_excluded=?, reason=?, updated_at=? "
                 "WHERE lower(email)=? AND mother_id=?",
-                (removed_at, reason, removed_at, normalized_email, normalized_mother),
+                (
+                    removed_at,
+                    None if permanently_excluded else cooldown_value,
+                    1 if permanently_excluded else 0,
+                    reason,
+                    removed_at,
+                    normalized_email,
+                    normalized_mother,
+                ),
             )
             if cur.rowcount == 0:
                 con.execute(
                     "INSERT OR IGNORE INTO team_rotation_member_history "
-                    "(email, mother_id, joined_at, removed_at, reason, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    "(email, mother_id, joined_at, removed_at, cooldown_until, "
+                    "permanently_excluded, reason, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         normalized_email,
                         normalized_mother,
                         removed_at,
                         removed_at,
+                        None if permanently_excluded else cooldown_value,
+                        1 if permanently_excluded else 0,
                         reason,
                         removed_at,
                         removed_at,
@@ -1581,18 +1630,17 @@ def claim_team_rotation_candidate(mother_id: str) -> Optional[dict]:
                 f"{domain_clause}"
                 "AND NOT EXISTS ("
                 "  SELECT 1 FROM team_rotation_member_history AS th "
-                "  WHERE lower(th.email)=lower(r.email) AND th.mother_id=?"
+                "  WHERE lower(th.email)=lower(r.email) AND th.mother_id=? "
+                "  AND (th.permanently_excluded=1 OR th.cooldown_until>?)"
                 ") "
-                "AND (tm.id IS NULL OR ("
-                "  tm.status IN ('exhausted','removed') AND tm.mother_id<>?"
-                ")) "
+                "AND (tm.id IS NULL OR tm.status IN ('exhausted','removed','cooldown')) "
                 "ORDER BY CASE WHEN tm.id IS NULL THEN 0 ELSE 1 END, "
                 "r.created_at ASC LIMIT 1"
             )
             params = (
-                (required_domain, mother_id, mother_id)
+                (required_domain, mother_id, now)
                 if required_domain
-                else (mother_id, mother_id)
+                else (mother_id, now)
             )
             row = con.execute(query, params).fetchone()
             if not row:
@@ -1669,16 +1717,15 @@ def has_team_rotation_candidate(mother_id: str) -> bool:
             f"{domain_clause}"
             "AND NOT EXISTS ("
             "  SELECT 1 FROM team_rotation_member_history AS th "
-            "  WHERE lower(th.email)=lower(r.email) AND th.mother_id=?"
+            "  WHERE lower(th.email)=lower(r.email) AND th.mother_id=? "
+            "  AND (th.permanently_excluded=1 OR th.cooldown_until>?)"
             ") "
-            "AND (tm.id IS NULL OR ("
-            "  tm.status IN ('exhausted','removed') AND tm.mother_id<>?"
-            ")) LIMIT 1"
+            "AND (tm.id IS NULL OR tm.status IN ('exhausted','removed','cooldown')) LIMIT 1"
         )
         params = (
-            (required_domain, mother_id, mother_id)
+            (required_domain, mother_id, time.time())
             if required_domain
-            else (mother_id, mother_id)
+            else (mother_id, time.time())
         )
         row = con.execute(query, params).fetchone()
         return row is not None
@@ -1774,7 +1821,7 @@ def list_team_rotation_members(
 
 
 def team_rotation_counts() -> dict:
-    out = {"total": 0, "pending": 0, "active": 0, "exhausted": 0, "removed": 0, "failed": 0}
+    out = {"total": 0, "pending": 0, "active": 0, "cooldown": 0, "exhausted": 0, "removed": 0, "failed": 0}
     con = _conn()
     try:
         rows = con.execute(

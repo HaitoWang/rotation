@@ -1268,18 +1268,31 @@ class TeamRotationController:
                     continue
                 classification = str(hub_status.get("classification") or "hub_error")
                 checked_at = time.time()
-                if classification == "rate_limited":
+                if classification in {"short_rate_limited", "weekly_exhausted"}:
+                    permanent = classification == "weekly_exhausted"
+                    reset_at = hub_status.get("reset_at")
+                    try:
+                        cooldown_until = float(reset_at) if reset_at else checked_at + 5 * 3600
+                    except (TypeError, ValueError):
+                        cooldown_until = checked_at + 5 * 3600
+                    reason = hub_status.get("error") or (
+                        "Sub2API 账号 7d 额度耗尽"
+                        if permanent
+                        else "Sub2API 账号 5h 临时限流"
+                    )
                     db.update_team_rotation_member(
                         assignment["id"],
                         last_checked_at=checked_at,
-                        error=hub_status.get("error") or "Sub2API 账号限流",
+                        error=reason,
                     )
                     self._remove_assignment(
                         service,
                         mother,
                         assignment,
-                        hub_status.get("error") or "Sub2API 账号限流，移出 Team",
-                        "exhausted",
+                        f"{reason}，移出 Team",
+                        "exhausted" if permanent else "cooldown",
+                        cooldown_until=None if permanent else cooldown_until,
+                        permanently_excluded=permanent,
                     )
                     removed_count += 1
                     seats["remaining_default"] = int(seats.get("remaining_default") or 0) + 1
@@ -1295,6 +1308,7 @@ class TeamRotationController:
 
                 if classification == "inactive":
                     reason = hub_status.get("error") or "Sub2API 账号当前不可调度"
+                    cooldown_until = checked_at + 3600
                     db.update_team_rotation_member(
                         assignment["id"],
                         last_checked_at=checked_at,
@@ -1305,7 +1319,8 @@ class TeamRotationController:
                         mother,
                         assignment,
                         f"{reason}，移出 Team",
-                        "removed",
+                        "cooldown",
+                        cooldown_until=cooldown_until,
                     )
                     removed_count += 1
                     seats["remaining_default"] = int(seats.get("remaining_default") or 0) + 1
@@ -1505,6 +1520,9 @@ class TeamRotationController:
         assignment: dict,
         reason: str,
         status: str,
+        *,
+        cooldown_until: Optional[float] = None,
+        permanently_excluded: bool = False,
     ) -> None:
         member_id = str(assignment.get("member_id") or "")
         if not member_id:
@@ -1517,7 +1535,11 @@ class TeamRotationController:
             error=str(reason)[:1000],
         )
         db.record_team_rotation_removal(
-            assignment["email"], mother["id"], reason=str(reason)
+            assignment["email"],
+            mother["id"],
+            reason=str(reason),
+            cooldown_until=cooldown_until,
+            permanently_excluded=permanently_excluded,
         )
         self._event("INFO", "remove", reason, mother["id"], assignment["email"])
 

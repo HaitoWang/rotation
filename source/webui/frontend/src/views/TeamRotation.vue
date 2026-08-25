@@ -56,6 +56,7 @@ const stateMeta = computed(() => ({
 const memberFilterOptions = computed(() => [
   { value: 'all', label: '全部', count: status.value.members.length },
   { value: 'active', label: '使用中', count: status.value.members.filter((item) => item.status === 'active').length },
+  { value: 'cooldown', label: '临时冷却', count: status.value.members.filter((item) => item.status === 'cooldown').length },
   { value: 'pending', label: '待加入', count: status.value.members.filter((item) => item.status === 'pending').length },
   { value: 'auth_required', label: '待重授权', count: status.value.members.filter((item) => item.status === 'auth_required').length },
   { value: 'exhausted', label: '已轮出', count: status.value.members.filter((item) => item.status === 'exhausted').length },
@@ -99,6 +100,7 @@ function statusTag(value) {
     pending: ['待加入', 'warning'],
     auth_required: ['待人工重授权', 'warning'],
     active: ['使用中', 'success'],
+    cooldown: ['临时冷却', 'warning'],
     exhausted: ['限流移出', 'danger'],
     removed: ['已移出', 'info'],
     failed: ['加入失败', 'danger'],
