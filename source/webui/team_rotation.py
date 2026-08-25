@@ -1294,10 +1294,28 @@ class TeamRotationController:
                     continue
 
                 if classification == "inactive":
+                    reason = hub_status.get("error") or "Sub2API 账号当前不可调度"
                     db.update_team_rotation_member(
                         assignment["id"],
                         last_checked_at=checked_at,
-                        error=hub_status.get("error") or "Sub2API 账号当前不可调度",
+                        error=reason,
+                    )
+                    self._remove_assignment(
+                        service,
+                        mother,
+                        assignment,
+                        f"{reason}，移出 Team",
+                        "removed",
+                    )
+                    removed_count += 1
+                    seats["remaining_default"] = int(seats.get("remaining_default") or 0) + 1
+                    if seats.get("in_use") is not None:
+                        seats["in_use"] = max(0, int(seats["in_use"]) - 1)
+                    db.record_team_mother_check(
+                        mother_id,
+                        entitled=seats.get("entitled"),
+                        in_use=seats.get("in_use"),
+                        remaining=seats.get("remaining_default"),
                     )
                     continue
 
