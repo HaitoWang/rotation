@@ -249,6 +249,24 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_team_rotation_members_mother
         ON team_rotation_members(mother_id, status, updated_at DESC);
 
+        CREATE TABLE IF NOT EXISTS team_rotation_member_history (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            email       TEXT NOT NULL,
+            mother_id   TEXT NOT NULL,
+            joined_at   REAL NOT NULL,
+            removed_at  REAL,
+            reason      TEXT,
+            created_at  REAL NOT NULL,
+            updated_at  REAL NOT NULL,
+            UNIQUE(email, mother_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_team_rotation_history_email
+        ON team_rotation_member_history(email, joined_at DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_team_rotation_history_mother
+        ON team_rotation_member_history(mother_id, joined_at DESC);
+
         CREATE TABLE IF NOT EXISTS team_rotation_events (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             level       TEXT NOT NULL,
@@ -342,6 +360,32 @@ def init_db():
             "ALTER TABLE team_mothers "
             "ADD COLUMN auto_accept_configured INTEGER NOT NULL DEFAULT 0"
         )
+
+    # 补齐历史母号使用记录。旧版只保留当前 assignment，无法恢复完整历史，
+    # 但可以从成功 join 事件和现有已加入/已移出记录尽量回填，避免继续扩大循环。
+    con.execute(
+        "INSERT OR IGNORE INTO team_rotation_member_history "
+        "(email, mother_id, joined_at, removed_at, reason, created_at, updated_at) "
+        "SELECT lower(trim(email)), mother_id, MIN(created_at), NULL, '', "
+        "MIN(created_at), ? FROM team_rotation_events "
+        "WHERE action='join' AND message LIKE '%已加入 Team%' "
+        "AND trim(coalesce(email, ''))<>'' "
+        "AND trim(coalesce(mother_id, ''))<>'' "
+        "GROUP BY lower(trim(email)), mother_id",
+        (time.time(),),
+    )
+    con.execute(
+        "INSERT OR IGNORE INTO team_rotation_member_history "
+        "(email, mother_id, joined_at, removed_at, reason, created_at, updated_at) "
+        "SELECT lower(trim(email)), mother_id, "
+        "COALESCE(joined_at, created_at, ?), removed_at, error, "
+        "COALESCE(joined_at, created_at, ?), ? "
+        "FROM team_rotation_members "
+        "WHERE status IN ('active', 'exhausted', 'removed') "
+        "AND trim(coalesce(email, ''))<>'' "
+        "AND trim(coalesce(mother_id, ''))<>''",
+        (time.time(), time.time(), time.time()),
+    )
     con.commit()
     con.close()
 
@@ -1421,6 +1465,94 @@ def _team_candidate_domain(mother_id: str) -> str:
     return email.rsplit("@", 1)[1] if "@" in email else "__missing_mother_domain__"
 
 
+def record_team_rotation_join(email: str, mother_id: str, joined_at: Optional[float] = None) -> bool:
+    """Record the first successful Team join for an email/mother pair."""
+    normalized_email = str(email or "").strip().lower()
+    normalized_mother = str(mother_id or "").strip()
+    if not normalized_email or not normalized_mother:
+        return False
+    joined_at = float(joined_at or time.time())
+    with _lock:
+        con = _conn()
+        try:
+            cur = con.execute(
+                "INSERT OR IGNORE INTO team_rotation_member_history "
+                "(email, mother_id, joined_at, removed_at, reason, created_at, updated_at) "
+                "VALUES (?, ?, ?, NULL, '', ?, ?)",
+                (normalized_email, normalized_mother, joined_at, joined_at, joined_at),
+            )
+            con.commit()
+            return cur.rowcount > 0
+        finally:
+            con.close()
+
+
+def record_team_rotation_removal(
+    email: str,
+    mother_id: str,
+    reason: str = "",
+    removed_at: Optional[float] = None,
+) -> bool:
+    """Record removal while keeping the email/mother pair permanently consumed."""
+    normalized_email = str(email or "").strip().lower()
+    normalized_mother = str(mother_id or "").strip()
+    if not normalized_email or not normalized_mother:
+        return False
+    removed_at = float(removed_at or time.time())
+    reason = str(reason or "")[:1000]
+    with _lock:
+        con = _conn()
+        try:
+            cur = con.execute(
+                "UPDATE team_rotation_member_history SET removed_at=?, reason=?, updated_at=? "
+                "WHERE lower(email)=? AND mother_id=?",
+                (removed_at, reason, removed_at, normalized_email, normalized_mother),
+            )
+            if cur.rowcount == 0:
+                con.execute(
+                    "INSERT OR IGNORE INTO team_rotation_member_history "
+                    "(email, mother_id, joined_at, removed_at, reason, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        normalized_email,
+                        normalized_mother,
+                        removed_at,
+                        removed_at,
+                        reason,
+                        removed_at,
+                        removed_at,
+                    ),
+                )
+            con.commit()
+            return True
+        finally:
+            con.close()
+
+
+def list_team_rotation_member_history(email: str = "") -> list[dict]:
+    normalized_email = str(email or "").strip().lower()
+    con = _conn()
+    try:
+        if normalized_email:
+            rows = con.execute(
+                "SELECT h.*, m.name AS mother_name "
+                "FROM team_rotation_member_history AS h "
+                "LEFT JOIN team_mothers AS m ON m.id=h.mother_id "
+                "WHERE lower(h.email)=? ORDER BY h.joined_at ASC",
+                (normalized_email,),
+            ).fetchall()
+        else:
+            rows = con.execute(
+                "SELECT h.*, m.name AS mother_name "
+                "FROM team_rotation_member_history AS h "
+                "LEFT JOIN team_mothers AS m ON m.id=h.mother_id "
+                "ORDER BY h.joined_at ASC"
+            ).fetchall()
+    finally:
+        con.close()
+    return [dict(row) for row in rows]
+
+
 def claim_team_rotation_candidate(mother_id: str) -> Optional[dict]:
     """Atomically reserve a fresh account or recycle one from another mother."""
     now = time.time()
@@ -1447,13 +1579,21 @@ def claim_team_rotation_candidate(mother_id: str) -> Optional[dict]:
                 "AND length(trim(coalesce(r.refresh_token, '')))>0 "
                 "AND (o.email IS NULL OR o.status='done') "
                 f"{domain_clause}"
+                "AND NOT EXISTS ("
+                "  SELECT 1 FROM team_rotation_member_history AS th "
+                "  WHERE lower(th.email)=lower(r.email) AND th.mother_id=?"
+                ") "
                 "AND (tm.id IS NULL OR ("
                 "  tm.status IN ('exhausted','removed') AND tm.mother_id<>?"
                 ")) "
                 "ORDER BY CASE WHEN tm.id IS NULL THEN 0 ELSE 1 END, "
                 "r.created_at ASC LIMIT 1"
             )
-            params = (required_domain, mother_id) if required_domain else (mother_id,)
+            params = (
+                (required_domain, mother_id, mother_id)
+                if required_domain
+                else (mother_id, mother_id)
+            )
             row = con.execute(query, params).fetchone()
             if not row:
                 con.rollback()
@@ -1527,11 +1667,19 @@ def has_team_rotation_candidate(mother_id: str) -> bool:
             "AND length(trim(coalesce(r.refresh_token, '')))>0 "
             "AND (o.email IS NULL OR o.status='done') "
             f"{domain_clause}"
+            "AND NOT EXISTS ("
+            "  SELECT 1 FROM team_rotation_member_history AS th "
+            "  WHERE lower(th.email)=lower(r.email) AND th.mother_id=?"
+            ") "
             "AND (tm.id IS NULL OR ("
             "  tm.status IN ('exhausted','removed') AND tm.mother_id<>?"
             ")) LIMIT 1"
         )
-        params = (required_domain, mother_id) if required_domain else (mother_id,)
+        params = (
+            (required_domain, mother_id, mother_id)
+            if required_domain
+            else (mother_id, mother_id)
+        )
         row = con.execute(query, params).fetchone()
         return row is not None
     finally:

@@ -996,6 +996,9 @@ class TeamRotationController:
                 db.update_team_rotation_member(
                     item["id"], status="removed", removed_at=time.time(), error="管理员手动移出"
                 )
+                db.record_team_rotation_removal(
+                    item["email"], mother_id, reason="管理员手动移出"
+                )
                 break
         self._event("INFO", "remove", f"管理员手动移出成员 {member_id}", mother_id)
         with self._lock:
@@ -1148,6 +1151,9 @@ class TeamRotationController:
                             status="removed",
                             removed_at=time.time(),
                             error="成员已不在 Team",
+                        )
+                        db.record_team_rotation_removal(
+                            assignment["email"], mother_id, reason="成员已不在 Team"
                         )
 
             if force_team_refresh or any(
@@ -1368,6 +1374,9 @@ class TeamRotationController:
                     joined_at=time.time(),
                     error="",
                 )
+                db.record_team_rotation_join(
+                    claim["email"], mother_id, joined_at=time.time()
+                )
                 join_mode_label = (
                     "无需审核"
                     if mother.get("join_mode") == "auto_accept_request"
@@ -1439,6 +1448,9 @@ class TeamRotationController:
             status=status,
             removed_at=time.time(),
             error=str(reason)[:1000],
+        )
+        db.record_team_rotation_removal(
+            assignment["email"], mother["id"], reason=str(reason)
         )
         self._event("INFO", "remove", reason, mother["id"], assignment["email"])
 

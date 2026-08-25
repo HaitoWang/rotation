@@ -546,6 +546,37 @@ class TeamRotationHubStateTests(unittest.TestCase):
         self.assertIsNone(recycled["hub_last_attempt_at"])
         self.assertEqual(recycled["hub_error"], "")
 
+    def test_member_cannot_cycle_back_to_a_mother_already_used(self):
+        mother_b = db.create_team_mother({
+            "name": "Team B",
+            "workspace_id": "team-workspace-b-cycle",
+            "access_token": "mother-b-access-token",
+            "enabled": True,
+        })
+        db.record_team_rotation_join("child@example.com", self.mother["id"], joined_at=100.0)
+        db.update_team_rotation_member(
+            self.assignment["id"], status="removed", removed_at=200.0
+        )
+        db.record_team_rotation_removal(
+            "child@example.com", self.mother["id"], reason="first mother exhausted", removed_at=200.0
+        )
+
+        claim_b = db.claim_team_rotation_candidate(mother_b["id"])
+        self.assertIsNotNone(claim_b)
+        self.assertEqual(claim_b["email"], "child@example.com")
+        db.update_team_rotation_member(claim_b["id"], status="removed", removed_at=300.0)
+        db.record_team_rotation_join("child@example.com", mother_b["id"], joined_at=250.0)
+        db.record_team_rotation_removal(
+            "child@example.com", mother_b["id"], reason="second mother exhausted", removed_at=300.0
+        )
+
+        self.assertFalse(db.has_team_rotation_candidate(self.mother["id"]))
+        self.assertIsNone(db.claim_team_rotation_candidate(self.mother["id"]))
+        self.assertEqual(
+            [item["mother_id"] for item in db.list_team_rotation_member_history("child@example.com")],
+            [self.mother["id"], mother_b["id"]],
+        )
+
     def test_exhausted_account_joins_another_mother(self):
         mother_b_public = db.create_team_mother({
             "name": "Team B",
