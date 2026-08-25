@@ -463,6 +463,7 @@ class TeamRotationHubStateTests(unittest.TestCase):
         controller = TeamRotationController(
             service_factory=mock.Mock(return_value=service)
         )
+        mother = db.get_team_mother(self.mother["id"], include_secret=True)
         with mock.patch.object(
             exporter,
             "get_sub2api_account_status",
@@ -476,6 +477,45 @@ class TeamRotationHubStateTests(unittest.TestCase):
             self.mother["id"], "child@example.com"
         )
         self.assertEqual(updated["status"], "exhausted")
+
+    def test_inactive_hub_member_is_removed_and_seat_is_released(self):
+        assignment = db.find_team_rotation_member(
+            self.mother["id"], "child@example.com"
+        )
+        db.update_team_rotation_member(
+            assignment["id"], status="active", member_id="member-1",
+            hub_status="success", hub_account_id="101",
+        )
+        db.record_team_mother_check(
+            self.mother["id"], entitled=2, in_use=1, remaining=1
+        )
+        service = mock.Mock()
+        service.remove_member.return_value = {"removed": True}
+        controller = TeamRotationController(
+            service_factory=mock.Mock(return_value=service)
+        )
+        mother = db.get_team_mother(self.mother["id"], include_secret=True)
+        with mock.patch.object(
+            exporter,
+            "get_sub2api_account_status",
+            return_value={
+                "classification": "inactive",
+                "error": "Sub2API 账号不可调度 (status=active)",
+            },
+        ):
+            controller._process_mother(
+                mother,
+                force_team_refresh=False,
+            )
+
+        service.remove_member.assert_called_once_with(mother, "member-1")
+        updated = db.find_team_rotation_member(
+            self.mother["id"], "child@example.com"
+        )
+        self.assertEqual(updated["status"], "removed")
+        updated_mother = db.get_team_mother(self.mother["id"])
+        self.assertEqual(updated_mother["seats_remaining"], 2)
+        self.assertEqual(updated_mother["seats_in_use"], 0)
 
     def test_reauthorized_hub_push_prefixes_display_name_only(self):
         controller = TeamRotationController(service_factory=mock.Mock())
