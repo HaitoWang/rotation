@@ -77,6 +77,9 @@ class Sub2ApiHubPayloadTests(unittest.TestCase):
         self.assertIsNone(account["proxy_id"])
         self.assertEqual(account["extra"], {
             "codex_fingerprint_mode": "session",
+            "openai_team_rotation_managed": True,
+            "openai_team_workspace_id": "team-workspace",
+            "openai_team_plan_type": "team",
         })
 
     def test_fingerprint_off_omits_extra(self):
@@ -459,6 +462,32 @@ class Sub2ApiHubPayloadTests(unittest.TestCase):
 
         self.assertEqual(result["classification"], "inactive")
 
+    def test_account_status_detects_team_workspace_overwritten_to_free(self):
+        response = mock.Mock(status_code=200)
+        response.json.return_value = {
+            "code": 0,
+            "data": {
+                "id": 101,
+                "status": "active",
+                "schedulable": True,
+                "credentials": {
+                    "plan_type": "free",
+                    "chatgpt_account_id": "personal-account",
+                },
+            },
+        }
+        cffi = mock.Mock()
+        cffi.get.return_value = response
+
+        with mock.patch.object(exporter, "_import_cffi", return_value=cffi):
+            result = exporter.get_sub2api_account_status({
+                "sub2api_url": "https://hub.example.com",
+                "sub2api_api_key": "admin-key",
+            }, 101, expected_workspace_id="team-workspace")
+
+        self.assertEqual(result["classification"], "team_mismatch")
+        self.assertIn("plan_type=free", result["error"])
+
 
 class TeamRotationHubStateTests(unittest.TestCase):
     def setUp(self):
@@ -578,6 +607,32 @@ class TeamRotationHubStateTests(unittest.TestCase):
             self.mother["id"], "child@example.com"
         )
         self.assertEqual(updated["hub_account_id"], "101")
+
+    def test_team_mismatch_repushes_same_hub_account_id(self):
+        db.update_team_rotation_member(
+            self.assignment["id"], hub_account_id="101", hub_status="success"
+        )
+        db.record_team_mother_check(
+            self.mother["id"], entitled=1, in_use=1, remaining=0
+        )
+        mother = db.get_team_mother(self.mother["id"], include_secret=True)
+        service = mock.Mock()
+        controller = TeamRotationController(
+            service_factory=mock.Mock(return_value=service)
+        )
+        with mock.patch.object(
+            exporter,
+            "get_sub2api_account_status",
+            return_value={
+                "classification": "team_mismatch",
+                "error": "plan_type=free",
+            },
+        ), mock.patch.object(controller, "_push_assignment_to_hub") as push:
+            controller._process_mother(mother, force_team_refresh=False)
+
+        push.assert_called_once()
+        pushed_assignment = push.call_args.args[1]
+        self.assertEqual(pushed_assignment["hub_account_id"], "101")
 
     def test_hub_5h_limited_member_is_removed_with_temporary_cooldown(self):
         assignment = db.find_team_rotation_member(
@@ -1388,7 +1443,7 @@ class TeamRotationHubStateTests(unittest.TestCase):
         lock = threading.Lock()
         observed = {"active": 0, "max_active": 0}
 
-        def check_status(_cfg, account_id):
+        def check_status(_cfg, account_id, **_kwargs):
             with lock:
                 observed["active"] += 1
                 observed["max_active"] = max(observed["max_active"], observed["active"])
