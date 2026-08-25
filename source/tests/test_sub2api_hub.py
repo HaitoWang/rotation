@@ -796,6 +796,58 @@ class TeamRotationHubStateTests(unittest.TestCase):
         updated = db.find_team_rotation_member(self.mother["id"], "child@example.com")
         self.assertEqual(updated["status"], "active")
         self.assertEqual(updated["hub_status"], "success")
+        self.assertEqual(updated["reauth_failure_count"], 0)
+
+    def test_two_reauthorization_failures_remove_member_and_stop_retrying(self):
+        assignment = db.find_team_rotation_member(
+            self.mother["id"], "child@example.com"
+        )
+        db.update_team_rotation_member(
+            assignment["id"], hub_status="success", hub_account_id="101"
+        )
+        service = mock.Mock()
+        service.get_team_detail.return_value = {
+            "seats": {"entitled": 2, "in_use": 2, "remaining_default": 0},
+            "members": [{"id": "member-1", "email": "child@example.com"}],
+        }
+        service.remove_member.return_value = {"removed": True}
+        controller = TeamRotationController(
+            service_factory=mock.Mock(return_value=service)
+        )
+
+        with mock.patch.object(
+            exporter,
+            "get_sub2api_account_status",
+            return_value={"classification": "auth_required", "error": "access token expired"},
+        ), mock.patch(
+            "webui.registrar.reauthorize_registered_account",
+            return_value={"ok": False, "error": "HTTP 429 rate_limit_exceeded"},
+        ) as reauthorize:
+            controller._process_mother(self.mother)
+
+            after_first = db.find_team_rotation_member(
+                self.mother["id"], "child@example.com"
+            )
+            self.assertEqual(after_first["status"], "active")
+            self.assertEqual(after_first["reauth_failure_count"], 1)
+            service.remove_member.assert_not_called()
+
+            controller._process_mother(self.mother)
+
+            after_second = db.find_team_rotation_member(
+                self.mother["id"], "child@example.com"
+            )
+            self.assertEqual(after_second["status"], "auth_required")
+            self.assertEqual(after_second["reauth_failure_count"], 2)
+            self.assertIsNotNone(after_second["removed_at"])
+            service.remove_member.assert_called_once_with(self.mother, "member-1")
+            self.assertEqual(reauthorize.call_count, 2)
+
+            controller._process_mother(
+                db.get_team_mother(self.mother["id"], include_secret=True),
+                force_team_refresh=False,
+            )
+            self.assertEqual(reauthorize.call_count, 2)
 
     def test_invalid_hub_refresh_token_reauthorizes_and_retries_once(self):
         controller = TeamRotationController(service_factory=mock.Mock())

@@ -238,6 +238,8 @@ def init_db():
             hub_pushed_at            REAL,
             hub_last_attempt_at       REAL,
             hub_error                TEXT,
+            hub_account_id           TEXT,
+            reauth_failure_count      INTEGER NOT NULL DEFAULT 0,
             created_at               REAL NOT NULL,
             updated_at               REAL NOT NULL
         );
@@ -320,6 +322,11 @@ def init_db():
         con.execute("ALTER TABLE team_rotation_members ADD COLUMN hub_error TEXT")
     if "hub_account_id" not in rotation_cols:
         con.execute("ALTER TABLE team_rotation_members ADD COLUMN hub_account_id TEXT")
+    if "reauth_failure_count" not in rotation_cols:
+        con.execute(
+            "ALTER TABLE team_rotation_members "
+            "ADD COLUMN reauth_failure_count INTEGER NOT NULL DEFAULT 0"
+        )
     con.commit()
     con.close()
 
@@ -1394,6 +1401,7 @@ def claim_team_rotation_candidate(mother_id: str) -> Optional[dict]:
                     "last_checked_at=NULL, removed_at=NULL, error='', "
                     "hub_status='pending', hub_pushed_at=NULL, "
                     "hub_last_attempt_at=NULL, hub_error='', hub_account_id=NULL, "
+                    "reauth_failure_count=0, "
                     "created_at=?, updated_at=? WHERE id=?",
                     (mother_id, now, now, int(assignment_id)),
                 )
@@ -1461,7 +1469,7 @@ def update_team_rotation_member(member_row_id: int, **fields) -> None:
         "member_id", "status", "primary_used_percent", "secondary_used_percent",
         "joined_at", "last_checked_at", "removed_at", "error",
         "hub_status", "hub_pushed_at", "hub_last_attempt_at", "hub_error",
-        "hub_account_id",
+        "hub_account_id", "reauth_failure_count",
     }
     sets = []
     values = []

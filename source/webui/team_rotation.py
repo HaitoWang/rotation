@@ -1215,7 +1215,13 @@ class TeamRotationController:
                     db.update_team_rotation_member(
                         assignment["id"], last_checked_at=checked_at, error=error
                     )
-                    if not self._reauthorize_assignment(mother, assignment):
+                    auth_result = self._reauthorize_assignment(
+                        mother, assignment, service=service
+                    )
+                    if auth_result == "removed":
+                        removed_count += 1
+                        continue
+                    if auth_result != "success":
                         continue
                     hub_reauthorized_ids.add(int(assignment["id"]))
                     continue
@@ -1382,7 +1388,8 @@ class TeamRotationController:
         assignment: dict,
         *,
         repush_hub: bool = True,
-    ) -> bool:
+        service: Optional[TeamService] = None,
+    ) -> str:
         email = str(assignment.get("email") or "").strip().lower()
         self._event("WARNING", "auth", "Sub2API 账号状态异常，开始重新授权", mother["id"], email)
         try:
@@ -1396,10 +1403,45 @@ class TeamRotationController:
         except Exception as exc:
             result = {"ok": False, "error": str(exc)}
         if not result.get("ok"):
-            error = f"重新授权失败: {result.get('error') or '未知错误'}"
-            db.update_team_rotation_member(assignment["id"], error=error[:1000])
-            self._event("ERROR", "auth", error, mother["id"], email)
-            return False
+            failure_count = int(assignment.get("reauth_failure_count") or 0) + 1
+            detail = str(result.get("error") or "未知错误")
+            if failure_count < 2:
+                error = f"重新授权失败 ({failure_count}/2)，下一轮再试: {detail}"
+                db.update_team_rotation_member(
+                    assignment["id"],
+                    reauth_failure_count=failure_count,
+                    error=error[:1000],
+                )
+                self._event("ERROR", "auth", error, mother["id"], email)
+                return "failed"
+
+            error = f"连续重授权失败 {failure_count} 次，已移出 Team，等待人工重授权: {detail}"
+            db.update_team_rotation_member(
+                assignment["id"],
+                reauth_failure_count=failure_count,
+                error=error[:1000],
+            )
+            owned_service = service is None
+            remove_service = service or self._service_factory(self._options.get("proxy", ""))
+            try:
+                self._remove_assignment(
+                    remove_service,
+                    mother,
+                    assignment,
+                    error,
+                    "auth_required",
+                )
+            finally:
+                if owned_service:
+                    remove_service.close()
+            self._event(
+                "ERROR",
+                "auth",
+                f"连续重授权失败 {failure_count} 次，已停止自动重试",
+                mother["id"],
+                email,
+            )
+            return "removed"
 
         db.update_team_rotation_member(
             assignment["id"],
@@ -1407,6 +1449,7 @@ class TeamRotationController:
             hub_status="pending",
             hub_error="",
             hub_account_id=None,
+            reauth_failure_count=0,
         )
         self._event("INFO", "auth", "重新授权成功，重新推送 Hub", mother["id"], email)
         if repush_hub:
@@ -1416,7 +1459,7 @@ class TeamRotationController:
                 allow_reauthorize=False,
                 reauthorized=True,
             )
-        return True
+        return "success"
 
     def _push_assignment_to_hub(
         self,
@@ -1529,7 +1572,7 @@ class TeamRotationController:
                     mother,
                     assignment,
                     repush_hub=False,
-                ):
+                ) == "success":
                     self._push_assignment_to_hub(
                         mother,
                         assignment,
