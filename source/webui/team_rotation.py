@@ -693,20 +693,22 @@ class TeamService:
         TeamService._require(status, payload, action)
 
     def _confirm_joined_member(self, mother: dict, child: Credentials) -> dict:
-        member_id = child.user_id
-        for attempt in range(3):
+        member_id = ""
+        for attempt in range(5):
             detail = self.get_team_members(mother)
             match = next(
                 (item for item in detail["members"] if item.get("email") == child.email),
                 None,
             )
             if match:
-                member_id = str(match.get("id") or member_id)
+                member_id = str(match.get("id") or "").strip()
                 break
-            if attempt < 2:
-                time.sleep(1)
+            if attempt < 4:
+                time.sleep(min(1 + attempt, 3))
         if not member_id:
-            raise TeamApiError("子号已接受邀请，但无法确认 Team 成员 ID")
+            raise TeamApiError(
+                f"加入接口已受理，但 Team 成员列表中未找到 {child.email}，禁止推送 Hub"
+            )
         return {"member_id": member_id, "email": child.email}
 
     def check_quota(self, account: dict, workspace_id: str) -> dict:
@@ -1609,7 +1611,6 @@ class TeamRotationController:
             error="",
             hub_status="pending",
             hub_error="",
-            hub_account_id=None,
             reauth_failure_count=0,
         )
         self._event("INFO", "auth", "重新授权成功，重新推送 Hub", mother["id"], email)
@@ -1654,7 +1655,6 @@ class TeamRotationController:
         db.update_team_rotation_member(
             assignment["id"],
             hub_last_attempt_at=time.time(),
-            hub_account_id=None,
         )
 
         try:
@@ -1690,6 +1690,7 @@ class TeamRotationController:
                     refresh_token=tokens.get("refresh_token") or "",
                     id_token=tokens.get("id_token") or "",
                 ),
+                sub2api_account_id=assignment.get("hub_account_id"),
             ).get("sub2api") or {}
         except Exception as exc:
             result = {"ok": False, "error": str(exc)}

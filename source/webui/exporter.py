@@ -616,7 +616,8 @@ def build_sub2api_payload(
 
 
 def export_to_sub2api(cred: dict, cfg: dict, *,
-                        log_fn: Optional[Callable[[str, str], None]] = None) -> dict:
+                        log_fn: Optional[Callable[[str, str], None]] = None,
+                        existing_account_id: Any = None) -> dict:
     """SUB2API x-api-key 直连上传（无登录流程）。"""
     log = log_fn or (lambda m, lvl="info": logger.info(m))
 
@@ -675,6 +676,62 @@ def export_to_sub2api(cred: dict, cfg: dict, *,
         "x-api-key": api_key,
         "Idempotency-Key": idempotency_key,
     }
+
+    existing_id = str(existing_account_id or "").strip()
+    if existing_id:
+        update_url = f"{api_url}/api/v1/admin/accounts/{quote(existing_id, safe='')}"
+        update_payload = {
+            key: value for key, value in account_payload.items()
+            if key != "platform"
+        }
+        update_payload["status"] = "active"
+        try:
+            log(f"[SUB2API] 更新现有账号 #{existing_id} {email}...", "info")
+            response = cffi.put(
+                update_url,
+                headers=headers,
+                json=update_payload,
+                proxies=None,
+                verify=False,
+                timeout=timeout,
+                impersonate=_IMPERSONATE,
+            )
+            if response.status_code in (200, 201):
+                for path, body in (
+                    (f"/api/v1/admin/accounts/{quote(existing_id, safe='')}/recover-state", {}),
+                    (f"/api/v1/admin/accounts/{quote(existing_id, safe='')}/schedulable", {"schedulable": True}),
+                ):
+                    recovery = cffi.post(
+                        f"{api_url}{path}",
+                        headers=headers,
+                        json=body,
+                        proxies=None,
+                        verify=False,
+                        timeout=timeout,
+                        impersonate=_IMPERSONATE,
+                    )
+                    if not 200 <= recovery.status_code < 300:
+                        raise RuntimeError(
+                            f"更新账号 #{existing_id} 后恢复状态失败 HTTP {recovery.status_code}"
+                        )
+                log(f"[SUB2API] ✅ 已更新现有账号 #{existing_id} {email}", "ok")
+                return {
+                    "ok": True,
+                    "email": email,
+                    "account_id": existing_id,
+                    "updated": True,
+                    "message": f"SUB2API 账号已更新 #{existing_id}",
+                }
+            if response.status_code != 404:
+                body_preview = str(getattr(response, "text", "") or "")[:300]
+                return {
+                    "ok": False,
+                    "email": email,
+                    "error": f"更新 SUB2API 账号 #{existing_id} 失败 HTTP {response.status_code}: {body_preview}",
+                }
+            log(f"[SUB2API] 账号 #{existing_id} 已不存在，回退创建新账号", "warn")
+        except Exception as exc:
+            return {"ok": False, "email": email, "error": str(exc)}
 
     last_err = ""
     for attempt in range(1, MAX_ATTEMPTS + 1):
@@ -1181,7 +1238,8 @@ def run_exports(cred: dict, *,
                   cpa_cfg: Optional[dict] = None,
                   sub2api_cfg: Optional[dict] = None,
                   log_fn: Optional[Callable[[str, str], None]] = None,
-                  token_update_fn: Optional[Callable[[dict], None]] = None) -> dict:
+                  token_update_fn: Optional[Callable[[dict], None]] = None,
+                  sub2api_account_id: Any = None) -> dict:
     """注册完成后的可选导出入口。
 
     步骤：
@@ -1247,7 +1305,12 @@ def run_exports(cred: dict, *,
     if sub2_on:
         out["any_attempted"] = True
         try:
-            out["sub2api"] = export_to_sub2api(cred, sub2api_cfg, log_fn=log)
+            out["sub2api"] = export_to_sub2api(
+                cred,
+                sub2api_cfg,
+                log_fn=log,
+                existing_account_id=sub2api_account_id,
+            )
         except Exception as e:
             log(f"[SUB2API] 导出异常: {e}", "error")
             out["sub2api"] = {"ok": False, "error": str(e)}
