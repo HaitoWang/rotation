@@ -5,6 +5,7 @@ export const createTeamMother = (payload) => http.post('/api/team/mothers', payl
 export const updateTeamMother = (id, payload) => http.put(`/api/team/mothers/${id}`, payload)
 export const deleteTeamMother = (id) => http.delete(`/api/team/mothers/${id}`)
 export const getTeamMotherDetail = (id) => http.get(`/api/team/mothers/${id}/detail`)
+export const syncTeamMotherSeats = (id) => http.post(`/api/team/mothers/${id}/sync-seats`)
 export const removeTeamMember = (motherId, memberId) =>
   http.delete(`/api/team/mothers/${motherId}/members/${memberId}`)
 

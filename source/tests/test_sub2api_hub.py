@@ -1047,6 +1047,37 @@ class TeamRotationHubStateTests(unittest.TestCase):
         service.invite_and_accept.assert_not_called()
         service.check_quota.assert_not_called()
 
+    def test_cached_seats_fill_all_slots_without_rescanning_team(self):
+        db.record_team_mother_check(
+            self.mother["id"], entitled=3, in_use=1, remaining=2
+        )
+        for index in (2, 3):
+            db.save_registered({
+                "email": f"child-{index}@example.com",
+                "access_token": f"access-{index}",
+                "session_token": f"session-{index}",
+                "refresh_token": f"refresh-{index}",
+            })
+        service = mock.Mock()
+        service.invite_and_accept.side_effect = [
+            {"member_id": "member-2"},
+            {"member_id": "member-3"},
+        ]
+        controller = TeamRotationController(
+            service_factory=mock.Mock(return_value=service)
+        )
+
+        controller._process_mother(
+            db.get_team_mother(self.mother["id"], include_secret=True),
+            force_team_refresh=False,
+        )
+
+        service.get_team_detail.assert_not_called()
+        self.assertEqual(service.invite_and_accept.call_count, 2)
+        updated_mother = db.get_team_mother(self.mother["id"])
+        self.assertEqual(updated_mother["seats_in_use"], 3)
+        self.assertEqual(updated_mother["seats_remaining"], 0)
+
     def test_quota_concurrency_is_persisted_in_rotation_options(self):
         controller = TeamRotationController(service_factory=mock.Mock())
         saved = controller._save_options({

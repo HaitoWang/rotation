@@ -940,8 +940,38 @@ class TeamRotationController:
         with self._lock:
             if self._state != RotationState.RUNNING:
                 return
+            self._force_team_refresh = True
             self._next_cycle_at = time.time()
             self._wake_event.set()
+
+    def sync_mother_seats(self, mother_id: str = "") -> dict:
+        """Explicitly resync persisted seat counters from the upstream Team API."""
+        mothers = (
+            [db.get_team_mother(mother_id, include_secret=True)]
+            if mother_id
+            else db.list_team_mothers(include_secret=True, enabled_only=True)
+        )
+        mothers = [item for item in mothers if item]
+        if not mothers:
+            raise TeamApiError("母号不存在") if mother_id else TeamApiError("没有启用的母号")
+        results = []
+        for mother in mothers:
+            with self._mother_lock(mother["id"]):
+                service = self._service_factory(self._options.get("proxy", ""))
+                try:
+                    detail = service.get_team_detail(mother)
+                finally:
+                    service.close()
+                seats = detail["seats"]
+                db.record_team_mother_check(
+                    mother["id"],
+                    entitled=seats.get("entitled"),
+                    in_use=seats.get("in_use"),
+                    remaining=seats.get("remaining_default"),
+                )
+                results.append({"mother_id": mother["id"], "seats": seats})
+        self._event("INFO", "seats", f"已同步 {len(results)} 个母号席位")
+        return {"ok": True, "items": results}
 
     def snapshot(self) -> dict:
         with self._lock:
@@ -1252,6 +1282,15 @@ class TeamRotationController:
                         "exhausted",
                     )
                     removed_count += 1
+                    seats["remaining_default"] = int(seats.get("remaining_default") or 0) + 1
+                    if seats.get("in_use") is not None:
+                        seats["in_use"] = max(0, int(seats["in_use"]) - 1)
+                    db.record_team_mother_check(
+                        mother_id,
+                        entitled=seats.get("entitled"),
+                        in_use=seats.get("in_use"),
+                        remaining=seats.get("remaining_default"),
+                    )
                     continue
 
                 if classification == "inactive":
@@ -1272,6 +1311,15 @@ class TeamRotationController:
                     )
                     if auth_result == "removed":
                         removed_count += 1
+                        seats["remaining_default"] = int(seats.get("remaining_default") or 0) + 1
+                        if seats.get("in_use") is not None:
+                            seats["in_use"] = max(0, int(seats["in_use"]) - 1)
+                        db.record_team_mother_check(
+                            mother_id,
+                            entitled=seats.get("entitled"),
+                            in_use=seats.get("in_use"),
+                            remaining=seats.get("remaining_default"),
+                        )
                         continue
                     if auth_result != "success":
                         continue
@@ -1305,9 +1353,8 @@ class TeamRotationController:
                 )
 
             if removed_count:
-                seats["remaining_default"] = int(seats.get("remaining_default") or 0) + removed_count
-                if seats.get("in_use") is not None:
-                    seats["in_use"] = max(0, int(seats["in_use"]) - removed_count)
+                # Each successful removal is persisted immediately below. Keep
+                # this block only as a final absolute snapshot for old callers.
                 db.record_team_mother_check(
                     mother_id,
                     entitled=seats.get("entitled"),
@@ -1316,10 +1363,6 @@ class TeamRotationController:
                 )
 
             candidate_available = db.has_team_rotation_candidate(mother_id)
-            cached_remaining = int(seats.get("remaining_default") or 0)
-            if cached_remaining > 0 and candidate_available and detail is None:
-                refresh_team_detail()
-
             remaining = int(seats.get("remaining_default") or 0)
             consecutive_join_failures = 0
             joined_count = 0
@@ -1390,6 +1433,15 @@ class TeamRotationController:
                 self._event("INFO", "join", join_message, mother_id, claim["email"])
                 remaining -= 1
                 joined_count += 1
+                if seats.get("in_use") is not None:
+                    seats["in_use"] = int(seats["in_use"]) + 1
+                seats["remaining_default"] = remaining
+                db.record_team_mother_check(
+                    mother_id,
+                    entitled=seats.get("entitled"),
+                    in_use=seats.get("in_use"),
+                    remaining=remaining,
+                )
                 candidate_available = db.has_team_rotation_candidate(mother_id)
 
             if remaining > 0 and not candidate_available and (force_team_refresh or removed_count):
@@ -1401,9 +1453,6 @@ class TeamRotationController:
                 self._event("WARNING", "pool", pool_message, mother_id)
 
             if joined_count:
-                seats["remaining_default"] = remaining
-                if seats.get("in_use") is not None:
-                    seats["in_use"] = int(seats["in_use"]) + joined_count
                 db.record_team_mother_check(
                     mother_id,
                     entitled=seats.get("entitled"),
