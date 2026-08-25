@@ -607,8 +607,17 @@ def build_sub2api_payload(
     mode = str(fingerprint_mode or DEFAULT_SUB2API_FINGERPRINT_MODE).strip().lower()
     if mode not in SUB2API_FINGERPRINT_MODES:
         mode = DEFAULT_SUB2API_FINGERPRINT_MODE
+    extra: dict[str, Any] = {}
     if mode != "off":
-        account["extra"] = {"codex_fingerprint_mode": mode}
+        extra["codex_fingerprint_mode"] = mode
+    if plan_type.lower() == "team" and chatgpt_account_id:
+        extra.update({
+            "openai_team_rotation_managed": True,
+            "openai_team_workspace_id": chatgpt_account_id,
+            "openai_team_plan_type": "team",
+        })
+    if extra:
+        account["extra"] = extra
     return account
 
 
@@ -998,7 +1007,12 @@ def _sub2api_model_limit_active(extra: Any, now: float) -> bool:
     return False
 
 
-def get_sub2api_account_status(cfg: dict, account_id: Any) -> dict:
+def get_sub2api_account_status(
+    cfg: dict,
+    account_id: Any,
+    *,
+    expected_workspace_id: str = "",
+) -> dict:
     """读取一个 Hub 账号的调度状态，不调用 ChatGPT 余额接口。
 
     返回 classification：healthy、short_rate_limited、weekly_exhausted、
@@ -1036,6 +1050,23 @@ def get_sub2api_account_status(cfg: dict, account_id: Any) -> dict:
         return {"ok": False, "classification": "hub_error", "http_status": status, "error": "Sub2API 账号状态响应为空"}
 
     now = time.time()
+    expected_workspace = str(expected_workspace_id or "").strip()
+    credentials = data.get("credentials") if isinstance(data.get("credentials"), dict) else {}
+    if expected_workspace:
+        actual_workspace = str(credentials.get("chatgpt_account_id") or "").strip()
+        actual_plan = str(credentials.get("plan_type") or "").strip().lower()
+        if actual_workspace != expected_workspace or actual_plan != "team":
+            return {
+                "ok": True,
+                "classification": "team_mismatch",
+                "http_status": status,
+                "account": data,
+                "error": (
+                    "Sub2API Team 路由被覆盖: "
+                    f"plan_type={actual_plan or 'missing'}, "
+                    f"workspace={actual_workspace or 'missing'}"
+                ),
+            }
     account_status = str(data.get("status") or "").strip().lower()
     error_message = str(data.get("error_message") or data.get("error") or "").strip()
     if account_status == "error":

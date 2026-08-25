@@ -1229,7 +1229,9 @@ class TeamRotationController:
                     from . import exporter
 
                     return assignment, account, exporter.get_sub2api_account_status(
-                        export_cfg, hub_account_id
+                        export_cfg,
+                        hub_account_id,
+                        expected_workspace_id=mother["workspace_id"],
                     )
                 except Exception as exc:
                     return assignment, account, {
@@ -1369,6 +1371,17 @@ class TeamRotationController:
                         hub_error=hub_status.get("error") or "Sub2API 账号不存在",
                         last_checked_at=checked_at,
                         error=hub_status.get("error") or "等待重新推送 Sub2API",
+                    )
+                    continue
+
+                if classification == "team_mismatch":
+                    error = hub_status.get("error") or "Sub2API Team 路由配置不一致"
+                    db.update_team_rotation_member(
+                        assignment["id"],
+                        hub_status="pending",
+                        hub_error=error,
+                        last_checked_at=checked_at,
+                        error=error,
                     )
                     continue
 
