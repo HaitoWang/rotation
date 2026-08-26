@@ -706,23 +706,19 @@ def export_to_sub2api(cred: dict, cfg: dict, *,
                 impersonate=_IMPERSONATE,
             )
             if response.status_code in (200, 201):
-                for path, body in (
-                    (f"/api/v1/admin/accounts/{quote(existing_id, safe='')}/recover-state", {}),
-                    (f"/api/v1/admin/accounts/{quote(existing_id, safe='')}/schedulable", {"schedulable": True}),
-                ):
-                    recovery = cffi.post(
-                        f"{api_url}{path}",
-                        headers=headers,
-                        json=body,
-                        proxies=None,
-                        verify=False,
-                        timeout=timeout,
-                        impersonate=_IMPERSONATE,
+                recovery = cffi.post(
+                    f"{api_url}/api/v1/admin/accounts/{quote(existing_id, safe='')}/recover-state",
+                    headers=headers,
+                    json={},
+                    proxies=None,
+                    verify=False,
+                    timeout=timeout,
+                    impersonate=_IMPERSONATE,
+                )
+                if not 200 <= recovery.status_code < 300:
+                    raise RuntimeError(
+                        f"更新账号 #{existing_id} 后恢复状态失败 HTTP {recovery.status_code}"
                     )
-                    if not 200 <= recovery.status_code < 300:
-                        raise RuntimeError(
-                            f"更新账号 #{existing_id} 后恢复状态失败 HTTP {recovery.status_code}"
-                        )
                 log(f"[SUB2API] ✅ 已更新现有账号 #{existing_id} {email}", "ok")
                 return {
                     "ok": True,
@@ -1050,23 +1046,6 @@ def get_sub2api_account_status(
         return {"ok": False, "classification": "hub_error", "http_status": status, "error": "Sub2API 账号状态响应为空"}
 
     now = time.time()
-    expected_workspace = str(expected_workspace_id or "").strip()
-    credentials = data.get("credentials") if isinstance(data.get("credentials"), dict) else {}
-    if expected_workspace:
-        actual_workspace = str(credentials.get("chatgpt_account_id") or "").strip()
-        actual_plan = str(credentials.get("plan_type") or "").strip().lower()
-        if actual_workspace != expected_workspace or actual_plan != "team":
-            return {
-                "ok": True,
-                "classification": "team_mismatch",
-                "http_status": status,
-                "account": data,
-                "error": (
-                    "Sub2API Team 路由被覆盖: "
-                    f"plan_type={actual_plan or 'missing'}, "
-                    f"workspace={actual_workspace or 'missing'}"
-                ),
-            }
     account_status = str(data.get("status") or "").strip().lower()
     error_message = str(data.get("error_message") or data.get("error") or "").strip()
     if account_status == "error":
@@ -1185,6 +1164,24 @@ def get_sub2api_account_status(
             "account": data,
             "error": error_message or f"Sub2API 账号不可调度 (status={account_status or 'unknown'})",
         }
+
+    expected_workspace = str(expected_workspace_id or "").strip()
+    credentials = data.get("credentials") if isinstance(data.get("credentials"), dict) else {}
+    if expected_workspace:
+        actual_workspace = str(credentials.get("chatgpt_account_id") or "").strip()
+        actual_plan = str(credentials.get("plan_type") or "").strip().lower()
+        if actual_workspace != expected_workspace or actual_plan != "team":
+            return {
+                "ok": True,
+                "classification": "team_mismatch",
+                "http_status": status,
+                "account": data,
+                "error": (
+                    "Sub2API Team 路由被覆盖: "
+                    f"plan_type={actual_plan or 'missing'}, "
+                    f"workspace={actual_workspace or 'missing'}"
+                ),
+            }
 
     return {"ok": True, "classification": "healthy", "http_status": status, "account": data, "error": ""}
 

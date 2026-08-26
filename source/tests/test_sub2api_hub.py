@@ -203,11 +203,12 @@ class Sub2ApiHubPayloadTests(unittest.TestCase):
             cffi.put.call_args.kwargs["json"]["credentials"]["plan_type"],
             "team",
         )
-        self.assertEqual(cffi.post.call_count, 2)
+        self.assertEqual(cffi.post.call_count, 1)
         self.assertFalse(any(
             call.args[0].endswith("/accounts/batch")
             for call in cffi.post.call_args_list
         ))
+        self.assertTrue(cffi.post.call_args.args[0].endswith("/recover-state"))
 
     def test_missing_existing_hub_account_falls_back_to_batch_create(self):
         missing_response = mock.Mock(status_code=404, text="not found")
@@ -459,6 +460,31 @@ class Sub2ApiHubPayloadTests(unittest.TestCase):
                 "sub2api_url": "https://hub.example.com",
                 "sub2api_api_key": "admin-key",
             }, 101)
+
+        self.assertEqual(result["classification"], "inactive")
+
+    def test_stopped_scheduling_takes_priority_over_team_mismatch(self):
+        response = mock.Mock(status_code=200)
+        response.json.return_value = {
+            "code": 0,
+            "data": {
+                "id": 101,
+                "status": "active",
+                "schedulable": False,
+                "credentials": {
+                    "plan_type": "free",
+                    "chatgpt_account_id": "personal-account",
+                },
+            },
+        }
+        cffi = mock.Mock()
+        cffi.get.return_value = response
+
+        with mock.patch.object(exporter, "_import_cffi", return_value=cffi):
+            result = exporter.get_sub2api_account_status({
+                "sub2api_url": "https://hub.example.com",
+                "sub2api_api_key": "admin-key",
+            }, 101, expected_workspace_id="team-workspace")
 
         self.assertEqual(result["classification"], "inactive")
 
