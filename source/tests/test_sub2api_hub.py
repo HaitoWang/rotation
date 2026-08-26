@@ -210,6 +210,46 @@ class Sub2ApiHubPayloadTests(unittest.TestCase):
         ))
         self.assertTrue(cffi.post.call_args.args[0].endswith("/recover-state"))
 
+    def test_managed_paused_hub_account_is_reactivated_after_update(self):
+        update_response = mock.Mock(status_code=200, text="")
+        action_response = mock.Mock(status_code=200, text="")
+        cffi = mock.Mock()
+        cffi.put.return_value = update_response
+        cffi.post.return_value = action_response
+        with mock.patch.object(exporter, "_import_cffi", return_value=cffi):
+            result = exporter.export_to_sub2api({
+                "email": "user@example.com",
+                "access_token": self.access_token,
+                "account_id": "team-workspace",
+                "plan_type": "team",
+            }, {
+                "sub2api_url": "https://hub.example.com",
+                "sub2api_api_key": "admin-key",
+                "sub2api_group_ids": "12",
+            }, existing_account_id="101", reactivate_schedulable=True)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(cffi.post.call_count, 2)
+        self.assertTrue(cffi.post.call_args_list[1].args[0].endswith("/schedulable"))
+        self.assertEqual(
+            cffi.post.call_args_list[1].kwargs["json"], {"schedulable": True}
+        )
+
+    def test_set_hub_account_schedulable_false(self):
+        response = mock.Mock(status_code=200, text="")
+        cffi = mock.Mock()
+        cffi.post.return_value = response
+        with mock.patch.object(exporter, "_import_cffi", return_value=cffi):
+            result = exporter.set_sub2api_account_schedulable({
+                "sub2api_url": "https://hub.example.com",
+                "sub2api_api_key": "admin-key",
+            }, "101", False)
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["schedulable"])
+        self.assertTrue(cffi.post.call_args.args[0].endswith("/accounts/101/schedulable"))
+        self.assertEqual(cffi.post.call_args.kwargs["json"], {"schedulable": False})
+
     def test_missing_existing_hub_account_falls_back_to_batch_create(self):
         missing_response = mock.Mock(status_code=404, text="not found")
         create_response = mock.Mock(status_code=201, text="")
@@ -678,6 +718,10 @@ class TeamRotationHubStateTests(unittest.TestCase):
             service_factory=mock.Mock(return_value=service)
         )
         mother = db.get_team_mother(self.mother["id"], include_secret=True)
+        order = []
+        service.remove_member.side_effect = lambda *_args: (
+            order.append("remove") or {"removed": True}
+        )
         with mock.patch.object(
             exporter,
             "get_sub2api_account_status",
@@ -686,7 +730,14 @@ class TeamRotationHubStateTests(unittest.TestCase):
                 "error": "账号 5h 限流",
                 "reset_at": time.time() + 3600,
             },
-        ):
+        ), mock.patch.object(
+            exporter,
+            "set_sub2api_account_schedulable",
+            side_effect=lambda *_args: (
+                order.append("pause")
+                or {"ok": True, "account_id": "101", "schedulable": False}
+            ),
+        ) as pause_hub:
             controller._process_mother(self.mother)
 
         service.remove_member.assert_called_once_with(self.mother, "member-1")
@@ -695,9 +746,51 @@ class TeamRotationHubStateTests(unittest.TestCase):
             self.mother["id"], "child@example.com"
         )
         self.assertEqual(updated["status"], "cooldown")
+        pause_hub.assert_called_once()
+        self.assertEqual(updated["hub_status"], "paused")
+        self.assertEqual(order, ["pause", "remove"])
         history = db.list_team_rotation_member_history("child@example.com")
         self.assertFalse(history[0]["permanently_excluded"])
         self.assertGreater(history[0]["cooldown_until"], time.time())
+
+    def test_5h_member_is_not_removed_when_hub_pause_fails(self):
+        assignment = db.find_team_rotation_member(
+            self.mother["id"], "child@example.com"
+        )
+        db.update_team_rotation_member(
+            assignment["id"], status="active", member_id="member-1",
+            hub_status="success", hub_account_id="101",
+        )
+        service = mock.Mock()
+        service.get_team_detail.return_value = {
+            "seats": {"entitled": 1, "in_use": 1, "remaining_default": 0},
+            "members": [{"id": "member-1", "email": "child@example.com"}],
+        }
+        controller = TeamRotationController(
+            service_factory=mock.Mock(return_value=service)
+        )
+        with mock.patch.object(
+            exporter,
+            "get_sub2api_account_status",
+            return_value={
+                "classification": "short_rate_limited",
+                "error": "账号 5h 限流",
+                "reset_at": time.time() + 3600,
+            },
+        ), mock.patch.object(
+            exporter,
+            "set_sub2api_account_schedulable",
+            side_effect=RuntimeError("hub unavailable"),
+        ):
+            controller._process_mother(self.mother)
+
+        service.remove_member.assert_not_called()
+        updated = db.find_team_rotation_member(
+            self.mother["id"], "child@example.com"
+        )
+        self.assertEqual(updated["status"], "active")
+        self.assertEqual(updated["hub_status"], "pause_failed")
+        self.assertIn("本轮暂不移出 Team", updated["error"])
 
     def test_hub_7d_exhausted_member_is_permanently_excluded_for_mother(self):
         assignment = db.find_team_rotation_member(
@@ -720,6 +813,10 @@ class TeamRotationHubStateTests(unittest.TestCase):
             exporter,
             "get_sub2api_account_status",
             return_value={"classification": "weekly_exhausted", "error": "账号 7d 耗尽"},
+        ), mock.patch.object(
+            exporter,
+            "set_sub2api_account_schedulable",
+            return_value={"ok": True, "account_id": "101", "schedulable": False},
         ):
             controller._process_mother(self.mother)
 

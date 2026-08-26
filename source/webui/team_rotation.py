@@ -1219,6 +1219,11 @@ class TeamRotationController:
                         "classification": "disabled",
                         "error": "Sub2API 未启用，跳过账号状态检查",
                     }
+                if assignment.get("hub_status") == "paused":
+                    return assignment, account, {
+                        "classification": "managed_paused",
+                        "error": "轮转主动暂停，等待当前 Team 配置更新后恢复调度",
+                    }
                 hub_account_id = str(assignment.get("hub_account_id") or "").strip()
                 if not hub_account_id:
                     return assignment, account, {
@@ -1272,6 +1277,11 @@ class TeamRotationController:
                     continue
                 classification = str(hub_status.get("classification") or "hub_error")
                 checked_at = time.time()
+                if classification == "managed_paused":
+                    db.update_team_rotation_member(
+                        assignment["id"], last_checked_at=checked_at
+                    )
+                    continue
                 if classification in {"short_rate_limited", "weekly_exhausted"}:
                     permanent = classification == "weekly_exhausted"
                     reset_at = hub_status.get("reset_at")
@@ -1289,6 +1299,12 @@ class TeamRotationController:
                         last_checked_at=checked_at,
                         error=reason,
                     )
+                    if not self._pause_assignment_in_hub(mother, assignment):
+                        db.update_team_rotation_member(
+                            assignment["id"],
+                            error=f"{reason}；停止 Hub 调度失败，本轮暂不移出 Team",
+                        )
+                        continue
                     self._remove_assignment(
                         service,
                         mother,
@@ -1516,6 +1532,8 @@ class TeamRotationController:
                     break
                 if int(assignment["id"]) in hub_reauthorized_ids:
                     continue
+                if assignment.get("hub_status") == "pause_failed":
+                    continue
                 if assignment.get("hub_status") == "success" and assignment.get("hub_account_id"):
                     continue
                 if assignment.get("hub_status") == "failed":
@@ -1704,6 +1722,7 @@ class TeamRotationController:
                     id_token=tokens.get("id_token") or "",
                 ),
                 sub2api_account_id=assignment.get("hub_account_id"),
+                sub2api_reactivate_schedulable=(assignment.get("hub_status") == "paused"),
             ).get("sub2api") or {}
         except Exception as exc:
             result = {"ok": False, "error": str(exc)}
@@ -1761,6 +1780,40 @@ class TeamRotationController:
             self._event(
                 "ERROR", "hub", error, mother["id"], assignment["email"]
             )
+
+    def _pause_assignment_in_hub(self, mother: dict, assignment: dict) -> bool:
+        hub_account_id = str(assignment.get("hub_account_id") or "").strip()
+        if not hub_account_id:
+            return False
+        try:
+            export_cfg = db.get_export_internal_config().get("sub2api", {})
+            if not export_cfg.get("enabled"):
+                return False
+            from . import exporter
+
+            exporter.set_sub2api_account_schedulable(
+                export_cfg, hub_account_id, False
+            )
+        except Exception as exc:
+            error = f"额度移出后停止 Hub 调度失败: {exc}"
+            db.update_team_rotation_member(
+                assignment["id"], hub_status="pause_failed", hub_error=error[:1000]
+            )
+            self._event(
+                "ERROR", "hub", error, mother["id"], assignment["email"]
+            )
+            return False
+        db.update_team_rotation_member(
+            assignment["id"], hub_status="paused", hub_error=""
+        )
+        self._event(
+            "INFO",
+            "hub",
+            f"额度移出后已停止 Hub 调度 (account_id={hub_account_id})",
+            mother["id"],
+            assignment["email"],
+        )
+        return True
 
 
 CONTROLLER = TeamRotationController()
