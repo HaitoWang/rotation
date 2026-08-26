@@ -626,7 +626,8 @@ def build_sub2api_payload(
 
 def export_to_sub2api(cred: dict, cfg: dict, *,
                         log_fn: Optional[Callable[[str, str], None]] = None,
-                        existing_account_id: Any = None) -> dict:
+                        existing_account_id: Any = None,
+                        reactivate_schedulable: bool = False) -> dict:
     """SUB2API x-api-key 直连上传（无登录流程）。"""
     log = log_fn or (lambda m, lvl="info": logger.info(m))
 
@@ -719,6 +720,20 @@ def export_to_sub2api(cred: dict, cfg: dict, *,
                     raise RuntimeError(
                         f"更新账号 #{existing_id} 后恢复状态失败 HTTP {recovery.status_code}"
                     )
+                if reactivate_schedulable:
+                    scheduling = cffi.post(
+                        f"{api_url}/api/v1/admin/accounts/{quote(existing_id, safe='')}/schedulable",
+                        headers=headers,
+                        json={"schedulable": True},
+                        proxies=None,
+                        verify=False,
+                        timeout=timeout,
+                        impersonate=_IMPERSONATE,
+                    )
+                    if not 200 <= scheduling.status_code < 300:
+                        raise RuntimeError(
+                            f"恢复账号 #{existing_id} 调度失败 HTTP {scheduling.status_code}"
+                        )
                 log(f"[SUB2API] ✅ 已更新现有账号 #{existing_id} {email}", "ok")
                 return {
                     "ok": True,
@@ -871,6 +886,45 @@ def get_sub2api_groups(cfg: dict) -> dict:
         "ok": True,
         "groups": groups,
         "message": f"获取到 {len(groups)} 个可用 OpenAI 分组",
+    }
+
+
+def set_sub2api_account_schedulable(
+    cfg: dict,
+    account_id: Any,
+    schedulable: bool,
+) -> dict:
+    """Explicitly enable/disable one Sub2API account's scheduler participation."""
+    api_url = (cfg.get("sub2api_url") or "").rstrip("/").strip()
+    api_key = (cfg.get("sub2api_api_key") or "").strip()
+    account_id_text = str(account_id or "").strip()
+    if not api_url or not api_key or not account_id_text:
+        raise RuntimeError("SUB2API 调度设置缺少 URL、API Key 或 account_id")
+    timeout = int(cfg.get("sub2api_timeout") or DEFAULT_TIMEOUT)
+    cffi = _import_cffi()
+    response = cffi.post(
+        f"{api_url}/api/v1/admin/accounts/{quote(account_id_text, safe='')}/schedulable",
+        headers={
+            "Accept": "application/json, text/plain, */*",
+            "Content-Type": "application/json",
+            "Referer": f"{api_url}/admin/accounts",
+            "x-api-key": api_key,
+        },
+        json={"schedulable": bool(schedulable)},
+        proxies=None,
+        verify=False,
+        timeout=timeout,
+        impersonate=_IMPERSONATE,
+    )
+    if not 200 <= response.status_code < 300:
+        body = str(getattr(response, "text", "") or "")[:300]
+        raise RuntimeError(
+            f"SUB2API 账号 #{account_id_text} 设置调度失败 HTTP {response.status_code}: {body}"
+        )
+    return {
+        "ok": True,
+        "account_id": account_id_text,
+        "schedulable": bool(schedulable),
     }
 
 
@@ -1267,7 +1321,8 @@ def run_exports(cred: dict, *,
                   sub2api_cfg: Optional[dict] = None,
                   log_fn: Optional[Callable[[str, str], None]] = None,
                   token_update_fn: Optional[Callable[[dict], None]] = None,
-                  sub2api_account_id: Any = None) -> dict:
+                  sub2api_account_id: Any = None,
+                  sub2api_reactivate_schedulable: bool = False) -> dict:
     """注册完成后的可选导出入口。
 
     步骤：
@@ -1338,6 +1393,7 @@ def run_exports(cred: dict, *,
                 sub2api_cfg,
                 log_fn=log,
                 existing_account_id=sub2api_account_id,
+                reactivate_schedulable=sub2api_reactivate_schedulable,
             )
         except Exception as e:
             log(f"[SUB2API] 导出异常: {e}", "error")

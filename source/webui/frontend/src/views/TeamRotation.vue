@@ -111,6 +111,8 @@ function hubStatusTag(value) {
   return {
     success: ['已推送', 'success'],
     failed: ['推送失败', 'danger'],
+    paused: ['轮转暂停', 'warning'],
+    pause_failed: ['暂停失败', 'danger'],
     disabled: ['Hub 未启用', 'info'],
     pending: ['待推送', 'warning'],
   }[value] || [value || '待推送', 'warning']
