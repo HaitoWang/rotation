@@ -1319,6 +1319,7 @@ class TeamMotherCreateReq(BaseModel):
     workspace_id: str = Field("", max_length=200)
     enabled: bool = True
     join_mode: Literal["invite_accept", "auto_accept_request"] = "invite_accept"
+    preferred_seat_type: Literal["standard", "advanced"] = "standard"
 
 
 class TeamMotherUpdateReq(BaseModel):
@@ -1327,6 +1328,7 @@ class TeamMotherUpdateReq(BaseModel):
     workspace_id: Optional[str] = Field(None, max_length=200)
     enabled: Optional[bool] = None
     join_mode: Optional[Literal["invite_accept", "auto_accept_request"]] = None
+    preferred_seat_type: Optional[Literal["standard", "advanced"]] = None
 
 
 class TeamRotationStartReq(BaseModel):
@@ -1346,13 +1348,19 @@ def api_team_mothers():
 def api_create_team_mother(req: TeamMotherCreateReq):
     try:
         material = parse_mother_session(req.session, req.workspace_id)
-        if req.join_mode == "auto_accept_request" and not material.get("email"):
+        join_mode = (
+            "auto_accept_request"
+            if req.preferred_seat_type == "advanced"
+            else req.join_mode
+        )
+        if join_mode == "auto_accept_request" and not material.get("email"):
             raise ValueError("无需审核模式必须能从母号 Session 识别邮箱")
         item = db.create_team_mother({
             **material,
             "name": req.name.strip(),
             "enabled": req.enabled,
-            "join_mode": req.join_mode,
+            "join_mode": join_mode,
+            "preferred_seat_type": req.preferred_seat_type,
         })
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
@@ -1376,11 +1384,23 @@ def api_update_team_mother(mother_id: str, req: TeamMotherUpdateReq):
             raise HTTPException(400, str(exc)) from exc
     if "name" in changes:
         changes["name"] = str(changes["name"]).strip()
+    selected_seat_type = changes.get(
+        "preferred_seat_type",
+        existing.get("preferred_seat_type") or "standard",
+    )
+    if selected_seat_type == "advanced":
+        changes["join_mode"] = "auto_accept_request"
     selected_mode = changes.get("join_mode", existing.get("join_mode") or "invite_accept")
     selected_email = changes.get("email", existing.get("email") or "")
     if selected_mode == "auto_accept_request" and not selected_email:
         raise HTTPException(400, "无需审核模式必须能从母号 Session 识别邮箱")
-    if "join_mode" in changes and changes["join_mode"] != existing.get("join_mode"):
+    if (
+        "join_mode" in changes
+        and changes["join_mode"] != existing.get("join_mode")
+    ) or (
+        "preferred_seat_type" in changes
+        and changes["preferred_seat_type"] != existing.get("preferred_seat_type")
+    ):
         changes["auto_accept_configured"] = False
     try:
         item = db.update_team_mother(mother_id, changes)

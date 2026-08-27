@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from auth_flow import AuthFlow
 from webui import db, exporter, registrar
 from webui.team_rotation import (
     TeamApiError,
@@ -93,6 +94,88 @@ class Sub2ApiHubPayloadTests(unittest.TestCase):
         )
 
         self.assertNotIn("extra", account)
+
+    def test_advanced_team_payload_preserves_prolite_plan_and_seat_type(self):
+        account = exporter.build_sub2api_payload(
+            {
+                "email": "advanced@example.com",
+                "access_token": self.access_token,
+                "refresh_token": "refresh-token",
+                "account_id": "advanced-workspace",
+                "plan_type": "self_serve_business_prolite",
+                "seat_type": "advanced",
+            },
+            [12],
+        )
+
+        self.assertEqual(
+            account["credentials"]["plan_type"],
+            "self_serve_business_prolite",
+        )
+        self.assertEqual(
+            account["extra"]["openai_team_plan_type"],
+            "self_serve_business_prolite",
+        )
+        self.assertEqual(account["extra"]["openai_team_seat_type"], "advanced")
+
+    def test_advanced_export_rejects_personal_oauth_before_hub_write(self):
+        with mock.patch.object(
+            exporter,
+            "refresh_codex_token",
+            return_value={"access_token": self.access_token},
+        ), mock.patch.object(exporter, "export_to_sub2api") as upload:
+            result = exporter.run_exports(
+                {
+                    "email": "advanced@example.com",
+                    "refresh_token": "refresh-token",
+                    "account_id": "advanced-workspace",
+                    "plan_type": "self_serve_business_prolite",
+                    "seat_type": "advanced",
+                },
+                sub2api_cfg={"enabled": True},
+            )["sub2api"]
+
+        self.assertFalse(result["ok"])
+        self.assertIn("workspace 不匹配", result["error"])
+        upload.assert_not_called()
+
+    def test_advanced_export_accepts_matching_prolite_oauth(self):
+        advanced_token = _jwt({
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "advanced-workspace",
+                "chatgpt_plan_type": "self_serve_business_prolite",
+            },
+        })
+        with mock.patch.object(
+            exporter,
+            "refresh_codex_token",
+            return_value={"access_token": advanced_token},
+        ), mock.patch.object(
+            exporter,
+            "export_to_sub2api",
+            return_value={"ok": True, "account_id": "advanced-hub"},
+        ) as upload:
+            result = exporter.run_exports(
+                {
+                    "email": "advanced@example.com",
+                    "refresh_token": "refresh-token",
+                    "account_id": "advanced-workspace",
+                    "plan_type": "self_serve_business_prolite",
+                    "seat_type": "advanced",
+                },
+                sub2api_cfg={"enabled": True},
+            )["sub2api"]
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(upload.call_args.args[0]["access_token"], advanced_token)
+
+    def test_auth_flow_prefers_explicit_target_workspace(self):
+        flow = AuthFlow.__new__(AuthFlow)
+        flow._env_overrides = {
+            "OAUTH_TARGET_WORKSPACE_ID": "advanced-workspace",
+        }
+
+        self.assertEqual(flow._extract_workspace_id(), "advanced-workspace")
 
     def test_export_uses_batch_endpoint_and_stable_idempotency_header(self):
         response = mock.Mock(status_code=201)
@@ -554,6 +637,36 @@ class Sub2ApiHubPayloadTests(unittest.TestCase):
         self.assertEqual(result["classification"], "team_mismatch")
         self.assertIn("plan_type=free", result["error"])
 
+    def test_account_status_accepts_expected_advanced_plan(self):
+        response = mock.Mock(status_code=200)
+        response.json.return_value = {
+            "code": 0,
+            "data": {
+                "id": 101,
+                "status": "active",
+                "schedulable": True,
+                "credentials": {
+                    "plan_type": "self_serve_business_prolite",
+                    "chatgpt_account_id": "advanced-workspace",
+                },
+            },
+        }
+        cffi = mock.Mock()
+        cffi.get.return_value = response
+
+        with mock.patch.object(exporter, "_import_cffi", return_value=cffi):
+            result = exporter.get_sub2api_account_status(
+                {
+                    "sub2api_url": "https://hub.example.com",
+                    "sub2api_api_key": "admin-key",
+                },
+                101,
+                expected_workspace_id="advanced-workspace",
+                expected_plan_type="self_serve_business_prolite",
+            )
+
+        self.assertEqual(result["classification"], "healthy")
+
 
 class TeamRotationHubStateTests(unittest.TestCase):
     def setUp(self):
@@ -635,6 +748,29 @@ class TeamRotationHubStateTests(unittest.TestCase):
         self.assertEqual(updated["hub_status"], "success")
         self.assertIsNotNone(updated["hub_pushed_at"])
         self.assertEqual(updated["hub_error"], "")
+
+    def test_advanced_reauthorization_selects_configured_workspace(self):
+        db.update_team_mother(self.mother["id"], {
+            "preferred_seat_type": "advanced",
+        })
+        mother = db.get_team_mother(self.mother["id"], include_secret=True)
+        assignment = db.find_team_rotation_member(
+            self.mother["id"], "child@example.com"
+        )
+        controller = TeamRotationController(service_factory=mock.Mock())
+        with mock.patch.object(
+            registrar,
+            "reauthorize_registered_account",
+            return_value={"ok": True, "account": db.get_registered("child@example.com")},
+        ) as reauthorize:
+            result = controller._reauthorize_assignment(
+                mother, assignment, repush_hub=False
+            )
+
+        self.assertEqual(result, "success")
+        self.assertEqual(
+            reauthorize.call_args.kwargs["workspace_id"], "team-workspace"
+        )
 
     def test_successful_hub_push_persists_account_id(self):
         controller = TeamRotationController(service_factory=mock.Mock())
@@ -752,6 +888,108 @@ class TeamRotationHubStateTests(unittest.TestCase):
         history = db.list_team_rotation_member_history("child@example.com")
         self.assertFalse(history[0]["permanently_excluded"])
         self.assertGreater(history[0]["cooldown_until"], time.time())
+
+    def test_advanced_seat_ignores_short_window_rate_limit(self):
+        db.update_team_mother(self.mother["id"], {
+            "preferred_seat_type": "advanced",
+            "join_mode": "auto_accept_request",
+        })
+        assignment = db.find_team_rotation_member(
+            self.mother["id"], "child@example.com"
+        )
+        db.update_team_rotation_member(
+            assignment["id"], status="active", member_id="member-1",
+            seat_type="advanced", hub_status="success", hub_account_id="101",
+        )
+        service = mock.Mock()
+        service.get_team_detail.return_value = {
+            "seats": {
+                "entitled": 1,
+                "in_use": 1,
+                "remaining_default": 0,
+                "pools": {"advanced": {"paid": 1, "assigned": 1, "available": 0}},
+            },
+            "members": [{
+                "id": "member-1",
+                "email": "child@example.com",
+                "seat_type": "prolite",
+            }],
+        }
+        controller = TeamRotationController(
+            service_factory=mock.Mock(return_value=service)
+        )
+        mother = db.get_team_mother(self.mother["id"], include_secret=True)
+        with mock.patch.object(
+            exporter,
+            "get_sub2api_account_status",
+            return_value={
+                "classification": "short_rate_limited",
+                "error": "错误标记成 5h 限流",
+            },
+        ):
+            controller._process_mother(mother)
+
+        service.remove_member.assert_not_called()
+        updated = db.find_team_rotation_member(
+            self.mother["id"], "child@example.com"
+        )
+        self.assertEqual(updated["status"], "active")
+        self.assertIn("5h", updated["error"])
+
+    def test_advanced_weekly_exhaustion_cools_pair_until_reset(self):
+        db.update_team_mother(self.mother["id"], {
+            "preferred_seat_type": "advanced",
+            "join_mode": "auto_accept_request",
+        })
+        assignment = db.find_team_rotation_member(
+            self.mother["id"], "child@example.com"
+        )
+        db.update_team_rotation_member(
+            assignment["id"], status="active", member_id="member-1",
+            seat_type="advanced", hub_status="success", hub_account_id="101",
+        )
+        service = mock.Mock()
+        service.get_team_detail.return_value = {
+            "seats": {
+                "entitled": 1,
+                "in_use": 1,
+                "remaining_default": 0,
+                "pools": {"advanced": {"paid": 1, "assigned": 1, "available": 0}},
+            },
+            "members": [{
+                "id": "member-1",
+                "email": "child@example.com",
+                "seat_type": "prolite",
+            }],
+        }
+        service.remove_member.return_value = {"removed": True}
+        controller = TeamRotationController(
+            service_factory=mock.Mock(return_value=service)
+        )
+        mother = db.get_team_mother(self.mother["id"], include_secret=True)
+        reset_at = time.time() + 7 * 86400
+        with mock.patch.object(
+            exporter,
+            "get_sub2api_account_status",
+            return_value={
+                "classification": "weekly_exhausted",
+                "error": "高级席位周额度耗尽",
+                "reset_at": reset_at,
+            },
+        ), mock.patch.object(
+            exporter,
+            "set_sub2api_account_schedulable",
+            return_value={"ok": True, "account_id": "101", "schedulable": False},
+        ):
+            controller._process_mother(mother)
+
+        updated = db.find_team_rotation_member(
+            self.mother["id"], "child@example.com"
+        )
+        self.assertEqual(updated["status"], "cooldown")
+        history = db.list_team_rotation_member_history("child@example.com")
+        self.assertFalse(history[0]["permanently_excluded"])
+        self.assertAlmostEqual(history[0]["cooldown_until"], reset_at, delta=1)
 
     def test_5h_member_is_not_removed_when_hub_pause_fails(self):
         assignment = db.find_team_rotation_member(
@@ -1201,7 +1439,7 @@ class TeamRotationHubStateTests(unittest.TestCase):
             ) as child_request, mock.patch.object(
                 service,
                 "_confirm_joined_member",
-                side_effect=lambda _mother, child: {
+                side_effect=lambda _mother, child, **_kwargs: {
                     "member_id": child.user_id or child.email,
                     "email": child.email,
                 },
@@ -1219,22 +1457,180 @@ class TeamRotationHubStateTests(unittest.TestCase):
 
             self.assertEqual(first["member_id"], "first-user")
             self.assertEqual(second["member_id"], "second-user")
-            mother_request.assert_called_once()
-            self.assertTrue(
-                mother_request.call_args.args[2].endswith(
-                    "/settings/auto_accept_requests"
-                )
+            settings_calls = [
+                call for call in mother_request.call_args_list
+                if call.args[2].endswith("/settings/auto_accept_requests")
+            ]
+            self.assertEqual(len(settings_calls), 1)
+            self.assertEqual(settings_calls[0].kwargs["json_body"], {"value": True})
+            self.assertEqual(
+                len([
+                    call for call in mother_request.call_args_list
+                    if "/invites?" in call.args[2]
+                ]),
+                2,
             )
-            self.assertEqual(mother_request.call_args.kwargs["json_body"], {"value": True})
             self.assertEqual(child_request.call_count, 2)
             for call in child_request.call_args_list:
                 self.assertTrue(call.args[1].endswith("/invites/request"))
-                self.assertNotIn("account_id", call.kwargs)
+                self.assertEqual(call.kwargs["account_id"], "")
                 self.assertFalse(call.kwargs["include_cookies"])
                 self.assertFalse(call.kwargs["include_session_id"])
-                self.assertTrue(call.kwargs["json_content_type"])
+                self.assertNotIn("json_content_type", call.kwargs)
             updated = db.get_team_mother(self.mother["id"])
             self.assertTrue(updated["auto_accept_configured"])
+        finally:
+            service.close()
+
+    def test_advanced_mother_approves_pending_request_as_prolite(self):
+        db.update_team_mother(self.mother["id"], {
+            "email": "owner@example.com",
+            "join_mode": "auto_accept_request",
+            "preferred_seat_type": "advanced",
+            "auto_accept_configured": True,
+        })
+        mother = db.get_team_mother(self.mother["id"], include_secret=True)
+        service = TeamService()
+        pending = {
+            "id": "request-advanced-1",
+            "email": "advanced@example.com",
+            "role": "standard-user",
+            "seat_type": "default",
+        }
+        try:
+            with mock.patch.object(
+                service.client, "request", return_value=(200, {"id": "request-advanced-1"})
+            ) as child_request, mock.patch.object(
+                service,
+                "_find_pending_request",
+                side_effect=[None, pending],
+            ), mock.patch.object(
+                service,
+                "_mother_request",
+                return_value=(200, {"ok": True}),
+            ) as mother_request, mock.patch.object(
+                service,
+                "get_team_members",
+                side_effect=[
+                    {"members": [], "total_members": 0},
+                    {"members": [{
+                        "id": "advanced-user",
+                        "email": "advanced@example.com",
+                        "seat_type": "prolite",
+                    }], "total_members": 1},
+                ],
+            ), mock.patch("webui.team_rotation.time.sleep"):
+                result = service.invite_and_accept(mother, {
+                    "email": "advanced@example.com",
+                    "access_token": "advanced-access",
+                    "user_id": "advanced-user",
+                    "account_id": "personal-account",
+                })
+
+            self.assertEqual(result["member_id"], "advanced-user")
+            self.assertEqual(result["seat_type"], "advanced")
+            self.assertEqual(mother_request.call_args.args[1], "PATCH")
+            self.assertTrue(
+                mother_request.call_args.args[2].endswith(
+                    "/invites/request-advanced-1"
+                )
+            )
+            self.assertEqual(
+                mother_request.call_args.kwargs["json_body"],
+                {
+                    "role": "standard-user",
+                    "seat_type": "prolite",
+                    "accept_request": True,
+                },
+            )
+            self.assertEqual(child_request.call_args.kwargs["account_id"], "personal-account")
+            self.assertTrue(child_request.call_args.kwargs["empty_body"])
+            self.assertNotIn("json_body", child_request.call_args.kwargs)
+        finally:
+            service.close()
+
+    def test_existing_default_member_is_switched_and_verified_as_prolite(self):
+        db.update_team_mother(self.mother["id"], {
+            "preferred_seat_type": "advanced",
+        })
+        mother = db.get_team_mother(self.mother["id"], include_secret=True)
+        service = TeamService()
+        try:
+            with mock.patch.object(
+                service, "_mother_request", return_value=(200, {"ok": True})
+            ) as request, mock.patch.object(
+                service,
+                "get_team_members",
+                return_value={"members": [{
+                    "id": "member-1",
+                    "email": "child@example.com",
+                    "seat_type": "prolite",
+                }], "total_members": 1},
+            ), mock.patch("webui.team_rotation.time.sleep"):
+                result = service._ensure_member_seat_type(
+                    mother,
+                    {"id": "member-1", "email": "child@example.com", "seat_type": "default"},
+                    "prolite",
+                )
+
+            self.assertEqual(result["seat_type"], "prolite")
+            self.assertTrue(request.call_args.args[2].endswith("/users/member-1/seat/update"))
+            self.assertEqual(request.call_args.kwargs["json_body"]["seat_type"], "prolite")
+            self.assertEqual(request.call_args.kwargs["json_body"]["operation"], "switch")
+        finally:
+            service.close()
+
+    def test_advanced_mother_persists_official_seat_pools(self):
+        mother = db.create_team_mother({
+            "name": "Advanced Team",
+            "email": "owner@example.com",
+            "workspace_id": "advanced-workspace",
+            "access_token": "owner-token",
+            "preferred_seat_type": "advanced",
+        })
+        db.record_team_mother_check(
+            mother["id"],
+            entitled=1,
+            in_use=1,
+            remaining=3,
+            capacity={
+                "standard": {"paid": 0, "assigned": 0, "available": 0},
+                "advanced": {"paid": 4, "assigned": 1, "available": 3},
+            },
+        )
+
+        stored = db.get_team_mother(mother["id"])
+        self.assertEqual(stored["preferred_seat_type"], "advanced")
+        self.assertEqual(stored["join_mode"], "auto_accept_request")
+        self.assertEqual(stored["seats_remaining"], 3)
+        self.assertEqual(stored["seat_capacity"]["advanced"]["available"], 3)
+
+    def test_advanced_mother_uses_prolite_capacity_for_refill_count(self):
+        db.update_team_mother(self.mother["id"], {
+            "preferred_seat_type": "advanced",
+        })
+        mother = db.get_team_mother(self.mother["id"], include_secret=True)
+        service = TeamService()
+        try:
+            with mock.patch.object(
+                service,
+                "_mother_request",
+                return_value=(200, {
+                    "seats_entitled": 1,
+                    "seats_in_use": 1,
+                    "assigned": {"default": 1, "prolite": 2},
+                    "seat_capacity": [
+                        {"type": "default", "paid": 1, "available": 0},
+                        {"type": "prolite", "paid": 6, "available": 4},
+                    ],
+                }),
+            ):
+                seats = service.get_team_seats(mother)
+
+            self.assertEqual(seats["remaining_default"], 4)
+            self.assertEqual(seats["remaining_standard"], 0)
+            self.assertEqual(seats["remaining_advanced"], 4)
+            self.assertEqual(seats["pools"]["advanced"]["assigned"], 2)
         finally:
             service.close()
 

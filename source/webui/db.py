@@ -214,7 +214,9 @@ def init_db():
             owner_user_id     TEXT,
             enabled           INTEGER NOT NULL DEFAULT 1,
             join_mode         TEXT NOT NULL DEFAULT 'invite_accept',
+            preferred_seat_type TEXT NOT NULL DEFAULT 'standard',
             auto_accept_configured INTEGER NOT NULL DEFAULT 0,
+            seat_capacity_json TEXT,
             seats_entitled    INTEGER,
             seats_in_use      INTEGER,
             seats_remaining   INTEGER,
@@ -230,6 +232,7 @@ def init_db():
             email                    TEXT NOT NULL UNIQUE,
             member_id                TEXT,
             status                   TEXT NOT NULL DEFAULT 'pending',
+            seat_type                TEXT NOT NULL DEFAULT 'unknown',
             primary_used_percent     REAL,
             secondary_used_percent   REAL,
             joined_at                REAL,
@@ -361,6 +364,18 @@ def init_db():
         con.execute(
             "ALTER TABLE team_mothers "
             "ADD COLUMN auto_accept_configured INTEGER NOT NULL DEFAULT 0"
+        )
+    if "preferred_seat_type" not in mother_cols:
+        con.execute(
+            "ALTER TABLE team_mothers "
+            "ADD COLUMN preferred_seat_type TEXT NOT NULL DEFAULT 'standard'"
+        )
+    if "seat_capacity_json" not in mother_cols:
+        con.execute("ALTER TABLE team_mothers ADD COLUMN seat_capacity_json TEXT")
+    if "seat_type" not in rotation_cols:
+        con.execute(
+            "ALTER TABLE team_rotation_members "
+            "ADD COLUMN seat_type TEXT NOT NULL DEFAULT 'unknown'"
         )
 
     cur = con.execute("PRAGMA table_info(team_rotation_member_history)")
@@ -1304,15 +1319,20 @@ def get_registered(email: str) -> Optional[dict]:
 def create_team_mother(data: dict) -> dict:
     now = time.time()
     mother_id = str(data.get("id") or uuid.uuid4())
+    preferred_seat_type = str(
+        data.get("preferred_seat_type") or "standard"
+    ).strip().lower()
+    if preferred_seat_type not in {"standard", "advanced"}:
+        raise ValueError("母号席位类型只能是 standard/advanced")
     with _lock:
         con = _conn()
         try:
             con.execute(
                 "INSERT INTO team_mothers "
                 "(id, name, email, workspace_id, access_token, cookie_header, "
-                "owner_user_id, enabled, join_mode, auto_accept_configured, "
-                "created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "owner_user_id, enabled, join_mode, preferred_seat_type, "
+                "auto_accept_configured, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     mother_id,
                     str(data.get("name") or "").strip(),
@@ -1325,8 +1345,10 @@ def create_team_mother(data: dict) -> dict:
                     (
                         "auto_accept_request"
                         if data.get("join_mode") == "auto_accept_request"
+                        or preferred_seat_type == "advanced"
                         else "invite_accept"
                     ),
+                    preferred_seat_type,
                     1 if data.get("auto_accept_configured") else 0,
                     now,
                     now,
@@ -1339,9 +1361,13 @@ def create_team_mother(data: dict) -> dict:
 
 
 def update_team_mother(mother_id: str, data: dict) -> Optional[dict]:
+    data = dict(data)
+    if str(data.get("preferred_seat_type") or "").strip().lower() == "advanced":
+        data["join_mode"] = "auto_accept_request"
     allowed = {
         "name", "email", "workspace_id", "access_token", "cookie_header",
-        "owner_user_id", "enabled", "join_mode", "auto_accept_configured",
+        "owner_user_id", "enabled", "join_mode", "preferred_seat_type",
+        "auto_accept_configured",
     }
     sets = []
     values = []
@@ -1357,6 +1383,11 @@ def update_team_mother(mother_id: str, data: dict) -> Optional[dict]:
                 if value == "auto_accept_request"
                 else "invite_accept"
             )
+        elif key == "preferred_seat_type":
+            normalized = str(value or "").strip().lower()
+            if normalized not in {"standard", "advanced"}:
+                raise ValueError("母号席位类型只能是 standard/advanced")
+            values.append(normalized)
         elif key == "email":
             values.append(str(value or "").strip().lower())
         else:
@@ -1392,6 +1423,10 @@ def get_team_mother(mother_id: str, include_secret: bool = True) -> Optional[dic
     out = dict(row)
     out["enabled"] = bool(out.get("enabled"))
     out["auto_accept_configured"] = bool(out.get("auto_accept_configured"))
+    try:
+        out["seat_capacity"] = json.loads(out.pop("seat_capacity_json") or "{}")
+    except (TypeError, json.JSONDecodeError):
+        out["seat_capacity"] = {}
     if not include_secret:
         out["has_access_token"] = bool(out.get("access_token"))
         out["has_cookie"] = bool(out.get("cookie_header"))
@@ -1414,6 +1449,12 @@ def list_team_mothers(include_secret: bool = False, enabled_only: bool = False) 
         item = dict(row)
         item["enabled"] = bool(item.get("enabled"))
         item["auto_accept_configured"] = bool(item.get("auto_accept_configured"))
+        try:
+            item["seat_capacity"] = json.loads(
+                item.pop("seat_capacity_json") or "{}"
+            )
+        except (TypeError, json.JSONDecodeError):
+            item["seat_capacity"] = {}
         if not include_secret:
             item["has_access_token"] = bool(item.get("access_token"))
             item["has_cookie"] = bool(item.get("cookie_header"))
@@ -1447,6 +1488,7 @@ def record_team_mother_check(
     entitled: Optional[int] = None,
     in_use: Optional[int] = None,
     remaining: Optional[int] = None,
+    capacity: Optional[dict] = None,
     error: str = "",
 ) -> None:
     now = time.time()
@@ -1455,9 +1497,21 @@ def record_team_mother_check(
         try:
             con.execute(
                 "UPDATE team_mothers SET seats_entitled=?, seats_in_use=?, "
-                "seats_remaining=?, last_checked_at=?, last_error=?, updated_at=? "
+                "seats_remaining=?, seat_capacity_json=coalesce(?,seat_capacity_json), "
+                "last_checked_at=?, last_error=?, updated_at=? "
                 "WHERE id=?",
-                (entitled, in_use, remaining, now, str(error or "")[:1000], now, mother_id),
+                (
+                    entitled,
+                    in_use,
+                    remaining,
+                    json.dumps(capacity, ensure_ascii=False, separators=(",", ":"))
+                    if capacity is not None
+                    else None,
+                    now,
+                    str(error or "")[:1000],
+                    now,
+                    mother_id,
+                ),
             )
             con.commit()
         finally:
@@ -1736,7 +1790,7 @@ def has_team_rotation_candidate(mother_id: str) -> bool:
 
 def update_team_rotation_member(member_row_id: int, **fields) -> None:
     allowed = {
-        "member_id", "status", "primary_used_percent", "secondary_used_percent",
+        "member_id", "status", "seat_type", "primary_used_percent", "secondary_used_percent",
         "joined_at", "last_checked_at", "removed_at", "error",
         "hub_status", "hub_pushed_at", "hub_last_attempt_at", "hub_error",
         "hub_account_id", "reauth_failure_count",

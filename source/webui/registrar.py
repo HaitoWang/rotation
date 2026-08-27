@@ -277,6 +277,10 @@ def _session_env_overrides(
     }
     if options.get("want_refresh_token", True):
         env_overrides["REQUIRE_REFRESH_TOKEN"] = "1"
+    if options.get("target_workspace_id"):
+        env_overrides["OAUTH_TARGET_WORKSPACE_ID"] = str(
+            options["target_workspace_id"]
+        ).strip()
     if should_stop is not None:
         env_overrides["_should_stop"] = should_stop
     if register_password:
@@ -1362,6 +1366,7 @@ def reauthorize_registered_account(
     proxy: str = "",
     stop_event: Optional[threading.Event] = None,
     timeout: float = 900,
+    workspace_id: str = "",
 ) -> dict:
     """复用已有账号登录链，刷新 ChatGPT Session/Access Token。"""
     normalized = str(email or "").strip().lower()
@@ -1403,6 +1408,7 @@ def reauthorize_registered_account(
         "disable_session_race": True,
         "skip_exports": True,
         "push_to_hub": False,
+        "target_workspace_id": str(workspace_id or "").strip(),
     }
     run_id = ""
     try:

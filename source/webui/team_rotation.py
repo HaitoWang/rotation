@@ -28,6 +28,13 @@ _CODEX_TOKEN_CACHE: dict[str, dict[str, Any]] = {}
 _CODEX_TOKEN_LOCKS: dict[str, threading.Lock] = {}
 _CODEX_TOKEN_CACHE_TTL = 300.0
 
+SEAT_TYPE_STANDARD = "standard"
+SEAT_TYPE_ADVANCED = "advanced"
+SEAT_TYPE_UNKNOWN = "unknown"
+OPENAI_SEAT_TYPE_STANDARD = "default"
+OPENAI_SEAT_TYPE_ADVANCED = "prolite"
+JOIN_MEMBER_POLL_DELAYS = (1.0, 2.0, 4.0, 8.0, 8.0)
+
 
 def _codex_token_lock(email: str) -> threading.Lock:
     key = str(email or "").strip().lower()
@@ -220,12 +227,94 @@ def _remaining_default_seats(payload: Any) -> Optional[int]:
     return None
 
 
+def _normalized_seat_type(value: Any) -> str:
+    normalized = str(value or "").strip().lower().replace("-", "_")
+    if normalized in {
+        "advanced", "advanced_seat", "premium", "premium_seat", "prolite",
+        "weekly", "weekly_only", "week_only",
+    }:
+        return SEAT_TYPE_ADVANCED
+    if normalized in {
+        "standard", "standard_seat", "normal", "regular", "default",
+    }:
+        return SEAT_TYPE_STANDARD
+    return SEAT_TYPE_UNKNOWN
+
+
+def _preferred_seat_type(mother: dict) -> str:
+    seat_type = _normalized_seat_type(mother.get("preferred_seat_type"))
+    return seat_type if seat_type in {SEAT_TYPE_STANDARD, SEAT_TYPE_ADVANCED} else SEAT_TYPE_STANDARD
+
+
+def _openai_seat_type(value: Any) -> str:
+    return (
+        OPENAI_SEAT_TYPE_ADVANCED
+        if _normalized_seat_type(value) == SEAT_TYPE_ADVANCED
+        else OPENAI_SEAT_TYPE_STANDARD
+    )
+
+
+def _email_domain(email: Any) -> str:
+    normalized = str(email or "").strip().lower()
+    return normalized.rsplit("@", 1)[1] if "@" in normalized else ""
+
+
+def _subscription_seat_pools(payload: Any) -> dict[str, dict[str, Any]]:
+    details = _subscription_details(payload)
+    if not details:
+        return {}
+    assigned = details.get("assigned") if isinstance(details.get("assigned"), dict) else {}
+    pools = {
+        SEAT_TYPE_STANDARD: {
+            "upstream_type": OPENAI_SEAT_TYPE_STANDARD,
+            "paid": 0,
+            "assigned": _seat_count(assigned.get(OPENAI_SEAT_TYPE_STANDARD)) or 0,
+            "available": 0,
+            "held": 0,
+            "renewal_requested": 0,
+        },
+        SEAT_TYPE_ADVANCED: {
+            "upstream_type": OPENAI_SEAT_TYPE_ADVANCED,
+            "paid": 0,
+            "assigned": _seat_count(assigned.get(OPENAI_SEAT_TYPE_ADVANCED)) or 0,
+            "available": 0,
+            "held": 0,
+            "renewal_requested": 0,
+        },
+    }
+    capacity = details.get("seat_capacity")
+    entries: list[dict] = []
+    if isinstance(capacity, list):
+        entries = [item for item in capacity if isinstance(item, dict)]
+    elif isinstance(capacity, dict):
+        entries = [
+            {"type": seat_type, **value}
+            for seat_type, value in capacity.items()
+            if isinstance(value, dict)
+        ]
+    for item in entries:
+        local_type = _normalized_seat_type(item.get("type"))
+        if local_type not in pools:
+            continue
+        for key in ("paid", "available", "held", "renewal_requested"):
+            pools[local_type][key] = _seat_count(item.get(key)) or 0
+    if not entries:
+        entitled = _seat_count(details.get("seats_entitled")) or 0
+        in_use = _seat_count(details.get("seats_in_use")) or 0
+        pools[SEAT_TYPE_STANDARD].update({
+            "paid": entitled,
+            "assigned": in_use,
+            "available": max(0, entitled - in_use),
+        })
+    return pools
+
+
 def _payload_items(payload: Any) -> list[dict]:
     if isinstance(payload, list):
         return [item for item in payload if isinstance(item, dict)]
     if not isinstance(payload, dict):
         return []
-    for key in ("items", "users", "members"):
+    for key in ("items", "users", "members", "invites", "requests"):
         value = payload.get(key)
         if isinstance(value, list):
             return [item for item in value if isinstance(item, dict)]
@@ -531,25 +620,25 @@ class TeamService:
         )
         self._require(status, payload, "查询母号席位")
         details = _subscription_details(payload)
-        remaining = _remaining_default_seats(payload)
-        if not details or remaining is None:
+        pools = _subscription_seat_pools(payload)
+        if not details or not pools:
             raise TeamApiError("母号席位响应缺少可识别的数据")
-
-        capacity = []
-        raw_capacity = details.get("seat_capacity")
-        if isinstance(raw_capacity, list):
-            for item in raw_capacity:
-                if isinstance(item, dict):
-                    capacity.append({
-                        "type": str(item.get("type") or ""),
-                        "available": _seat_count(item.get("available")),
-                        "paid": _seat_count(item.get("paid")),
-                    })
+        preferred = _preferred_seat_type(mother)
+        remaining_standard = int(pools[SEAT_TYPE_STANDARD]["available"])
+        remaining_advanced = int(pools[SEAT_TYPE_ADVANCED]["available"])
+        remaining_configured = int(pools[preferred]["available"])
         return {
             "entitled": _seat_count(details.get("seats_entitled")),
             "in_use": _seat_count(details.get("seats_in_use")),
-            "remaining_default": remaining,
-            "capacity": capacity,
+            # Legacy controller consumers read remaining_default. Keep it as the
+            # configured pool while exposing both official pools explicitly.
+            "remaining_default": remaining_configured,
+            "remaining_standard": remaining_standard,
+            "remaining_advanced": remaining_advanced,
+            "remaining_configured": remaining_configured,
+            "preferred_seat_type": preferred,
+            "pools": pools,
+            "capacity": list(pools.values()),
         }
 
     def get_team_members(self, mother: dict) -> dict:
@@ -607,7 +696,10 @@ class TeamService:
         self._resolve_access_token(child, "子号")
         if not child.email:
             raise TeamApiError("子号缺少邮箱")
-        if str(mother.get("join_mode") or "") == "auto_accept_request":
+        if (
+            _preferred_seat_type(mother) == SEAT_TYPE_ADVANCED
+            or str(mother.get("join_mode") or "") == "auto_accept_request"
+        ):
             return self._auto_accept_request_join(mother, child)
         return self._invite_accept_join(mother, child)
 
@@ -641,10 +733,16 @@ class TeamService:
             retries=2,
         )
         self._require_child_join(status, payload, "子号接受邀请")
-        return self._confirm_joined_member(mother, child)
+        return self._confirm_joined_member(
+            mother, child, desired_seat_type=OPENAI_SEAT_TYPE_STANDARD
+        )
 
     def _auto_accept_request_join(self, mother: dict, child: Credentials) -> dict:
         workspace_id = str(mother.get("workspace_id") or "")
+        desired_seat_type = _openai_seat_type(_preferred_seat_type(mother))
+        mother_domain = _email_domain(mother.get("email"))
+        if not mother_domain or mother_domain != _email_domain(child.email):
+            raise TeamApiError("无需审核加入要求母号与子号使用相同邮箱域")
         if not mother.get("auto_accept_configured"):
             status, payload = self._mother_request(
                 mother,
@@ -659,18 +757,26 @@ class TeamService:
                 raise TeamApiError("母号加入方式已变化，未保存无需审核状态")
             mother["auto_accept_configured"] = True
 
-        status, payload = self.client.request(
-            "POST",
-            f"/backend-api/accounts/{quote(workspace_id, safe='')}/invites/request",
+        pending = self._find_pending_request(mother, child.email)
+        if not pending:
+            status, payload = self.client.request(
+                "POST",
+                f"/backend-api/accounts/{quote(workspace_id, safe='')}/invites/request",
+                child,
+                account_id=child.account_id,
+                include_cookies=False,
+                include_session_id=False,
+                empty_body=True,
+                retries=2,
+            )
+            self._require_child_join(status, payload, "子号申请加入")
+        return self._confirm_joined_member(
+            mother,
             child,
-            include_cookies=False,
-            include_session_id=False,
-            empty_body=True,
-            json_content_type=True,
-            retries=2,
+            desired_seat_type=desired_seat_type,
+            approve_pending=True,
+            pending=pending,
         )
-        self._require_child_join(status, payload, "子号申请加入")
-        return self._confirm_joined_member(mother, child)
 
     @staticmethod
     def _require_child_join(status: int, payload: Any, action: str) -> None:
@@ -692,9 +798,112 @@ class TeamService:
             )
         TeamService._require(status, payload, action)
 
-    def _confirm_joined_member(self, mother: dict, child: Credentials) -> dict:
-        member_id = ""
-        for attempt in range(5):
+    def _find_pending_request(self, mother: dict, email: str) -> Optional[dict]:
+        workspace_id = str(mother.get("workspace_id") or "")
+        status, payload = self._mother_request(
+            mother,
+            "GET",
+            f"/backend-api/accounts/{quote(workspace_id, safe='')}/invites"
+            f"?include_pending=false&include_requests=true&offset=0&limit=25"
+            f"&query={quote(email, safe='')}",
+            account_id=workspace_id,
+            referer="/admin/members?tab=requests",
+        )
+        self._require(status, payload, "查询待批准加入申请")
+        target = str(email or "").strip().lower()
+        for item in _payload_items(payload):
+            view = _member_view(item)
+            if view.get("email") == target:
+                return item
+        return None
+
+    def _approve_pending_request(
+        self, mother: dict, pending: dict, desired_seat_type: str
+    ) -> None:
+        request_id = str(
+            pending.get("id")
+            or pending.get("invite_id")
+            or pending.get("inviteId")
+            or pending.get("request_id")
+            or ""
+        ).strip()
+        if not request_id:
+            raise TeamApiError("待批准 Team 申请缺少 request id")
+        workspace_id = str(mother.get("workspace_id") or "")
+        status, payload = self._mother_request(
+            mother,
+            "PATCH",
+            f"/backend-api/accounts/{quote(workspace_id, safe='')}/invites/"
+            f"{quote(request_id, safe='')}",
+            account_id=workspace_id,
+            referer="/admin/members?tab=requests",
+            json_body={
+                "role": str(pending.get("role") or "standard-user"),
+                "seat_type": desired_seat_type,
+                "accept_request": True,
+            },
+        )
+        self._require(status, payload, "母号批准加入申请")
+
+    def _ensure_member_seat_type(
+        self, mother: dict, member: dict, desired_seat_type: str
+    ) -> dict:
+        desired_local = _normalized_seat_type(desired_seat_type)
+        current_raw = str(member.get("seat_type") or "").strip()
+        current_local = _normalized_seat_type(current_raw)
+        if current_local == desired_local or (
+            desired_local == SEAT_TYPE_STANDARD and not current_raw
+        ):
+            return member
+        member_id = str(member.get("id") or "").strip()
+        if not member_id:
+            raise TeamApiError("成员缺少 user_id，无法切换席位")
+        workspace_id = str(mother.get("workspace_id") or "")
+        status, payload = self._mother_request(
+            mother,
+            "POST",
+            f"/backend-api/accounts/{quote(workspace_id, safe='')}/users/"
+            f"{quote(member_id, safe='')}/seat/update",
+            account_id=workspace_id,
+            referer="/admin/members?tab=members",
+            json_body={
+                "operation": "switch",
+                "seat_type": desired_seat_type,
+                "flow_id": str(uuid.uuid4()),
+                "mutation_attempt_id": str(uuid.uuid4()),
+            },
+        )
+        self._require(status, payload, "切换 Team 席位")
+        email = str(member.get("email") or "").strip().lower()
+        verified: Optional[dict] = None
+        for _ in range(8):
+            detail = self.get_team_members(mother)
+            verified = next(
+                (item for item in detail["members"] if item.get("email") == email),
+                None,
+            )
+            if verified and _normalized_seat_type(verified.get("seat_type")) == desired_local:
+                return verified
+            time.sleep(0.5)
+        actual = (verified or {}).get("seat_type") or "unknown"
+        raise TeamApiError(
+            f"席位切换后校验失败: expected={desired_seat_type} actual={actual}"
+        )
+
+    def _confirm_joined_member(
+        self,
+        mother: dict,
+        child: Credentials,
+        *,
+        desired_seat_type: str = OPENAI_SEAT_TYPE_STANDARD,
+        approve_pending: bool = False,
+        pending: Optional[dict] = None,
+    ) -> dict:
+        approved = False
+        for attempt, delay in enumerate(JOIN_MEMBER_POLL_DELAYS):
+            if pending and approve_pending and not approved:
+                self._approve_pending_request(mother, pending, desired_seat_type)
+                approved = True
             detail = self.get_team_members(mother)
             match = next(
                 (item for item in detail["members"] if item.get("email") == child.email),
@@ -702,14 +911,31 @@ class TeamService:
             )
             if match:
                 member_id = str(match.get("id") or "").strip()
-                break
-            if attempt < 4:
-                time.sleep(min(1 + attempt, 3))
-        if not member_id:
-            raise TeamApiError(
-                f"加入接口已受理，但 Team 成员列表中未找到 {child.email}，禁止推送 Hub"
-            )
-        return {"member_id": member_id, "email": child.email}
+                try:
+                    verified = self._ensure_member_seat_type(
+                        mother, match, desired_seat_type
+                    )
+                except Exception:
+                    if member_id:
+                        try:
+                            self.remove_member(mother, member_id)
+                        except Exception:
+                            logger.exception("席位校验失败后清理 Team 成员失败")
+                    raise
+                return {
+                    "member_id": str(verified.get("id") or member_id),
+                    "email": child.email,
+                    "seat_type": _normalized_seat_type(
+                        verified.get("seat_type") or desired_seat_type
+                    ),
+                }
+            if approve_pending and not approved:
+                pending = self._find_pending_request(mother, child.email)
+            if attempt < len(JOIN_MEMBER_POLL_DELAYS) - 1:
+                time.sleep(delay)
+        raise TeamApiError(
+            f"加入接口已受理，但 Team 成员列表中未找到 {child.email}，禁止推送 Hub"
+        )
 
     def check_quota(self, account: dict, workspace_id: str) -> dict:
         # Web Session Token may remain bound to the previous Team after recycling;
@@ -970,6 +1196,7 @@ class TeamRotationController:
                     entitled=seats.get("entitled"),
                     in_use=seats.get("in_use"),
                     remaining=seats.get("remaining_default"),
+                    capacity=seats.get("pools"),
                 )
                 results.append({"mother_id": mother["id"], "seats": seats})
         self._event("INFO", "seats", f"已同步 {len(results)} 个母号席位")
@@ -1010,6 +1237,7 @@ class TeamRotationController:
             entitled=seats.get("entitled"),
             in_use=seats.get("in_use"),
             remaining=seats.get("remaining_default"),
+            capacity=seats.get("pools"),
         )
         return detail
 
@@ -1155,6 +1383,7 @@ class TeamRotationController:
                     entitled=seats.get("entitled"),
                     in_use=seats.get("in_use"),
                     remaining=seats.get("remaining_default"),
+                    capacity=seats.get("pools"),
                 )
                 upstream_by_email = {
                     item["email"]: item
@@ -1169,14 +1398,28 @@ class TeamRotationController:
                     upstream = upstream_by_email.get(
                         str(assignment.get("email") or "").lower()
                     )
+                    desired_seat = _openai_seat_type(_preferred_seat_type(mother))
+                    if upstream and _normalized_seat_type(
+                        upstream.get("seat_type")
+                    ) != _normalized_seat_type(desired_seat):
+                        upstream = service._ensure_member_seat_type(
+                            mother, upstream, desired_seat
+                        )
                     if upstream and assignment.get("status") != "active":
                         db.update_team_rotation_member(
                             assignment["id"],
                             status="active",
                             member_id=upstream.get("id") or assignment.get("member_id"),
+                            seat_type=_normalized_seat_type(upstream.get("seat_type")),
                             joined_at=assignment.get("joined_at") or time.time(),
                             error="",
                         )
+                    elif upstream:
+                        upstream_seat = _normalized_seat_type(upstream.get("seat_type"))
+                        if upstream_seat != SEAT_TYPE_UNKNOWN:
+                            db.update_team_rotation_member(
+                                assignment["id"], seat_type=upstream_seat
+                            )
                     elif not upstream and assignment.get("status") == "active":
                         db.update_team_rotation_member(
                             assignment["id"],
@@ -1237,6 +1480,11 @@ class TeamRotationController:
                         export_cfg,
                         hub_account_id,
                         expected_workspace_id=mother["workspace_id"],
+                        expected_plan_type=(
+                            "self_serve_business_prolite"
+                            if _preferred_seat_type(mother) == SEAT_TYPE_ADVANCED
+                            else "team"
+                        ),
                     )
                 except Exception as exc:
                     return assignment, account, {
@@ -1283,14 +1531,31 @@ class TeamRotationController:
                     )
                     continue
                 if classification in {"short_rate_limited", "weekly_exhausted"}:
-                    permanent = classification == "weekly_exhausted"
+                    advanced_seat = _preferred_seat_type(mother) == SEAT_TYPE_ADVANCED
+                    if advanced_seat and classification == "short_rate_limited":
+                        db.update_team_rotation_member(
+                            assignment["id"],
+                            last_checked_at=checked_at,
+                            error=(
+                                hub_status.get("error")
+                                or "高级席位没有 5h 窗口，等待周额度状态刷新"
+                            ),
+                        )
+                        continue
+                    permanent = classification == "weekly_exhausted" and not advanced_seat
                     reset_at = hub_status.get("reset_at")
                     try:
-                        cooldown_until = float(reset_at) if reset_at else checked_at + 5 * 3600
+                        cooldown_until = float(reset_at) if reset_at else checked_at + (
+                            7 * 86400 if classification == "weekly_exhausted" else 5 * 3600
+                        )
                     except (TypeError, ValueError):
-                        cooldown_until = checked_at + 5 * 3600
+                        cooldown_until = checked_at + (
+                            7 * 86400 if classification == "weekly_exhausted" else 5 * 3600
+                        )
                     reason = hub_status.get("error") or (
-                        "Sub2API 账号 7d 额度耗尽"
+                        "高级席位周额度耗尽，进入 7d pair 冷却"
+                        if advanced_seat and classification == "weekly_exhausted"
+                        else "Sub2API 账号 7d 额度耗尽"
                         if permanent
                         else "Sub2API 账号 5h 临时限流"
                     )
@@ -1478,6 +1743,7 @@ class TeamRotationController:
                     claim["id"],
                     status="active",
                     member_id=joined["member_id"],
+                    seat_type=joined.get("seat_type") or _preferred_seat_type(mother),
                     joined_at=time.time(),
                     error="",
                 )
@@ -1485,7 +1751,9 @@ class TeamRotationController:
                     claim["email"], mother_id, joined_at=time.time()
                 )
                 join_mode_label = (
-                    "无需审核"
+                    "高级席位"
+                    if _preferred_seat_type(mother) == SEAT_TYPE_ADVANCED
+                    else "无需审核"
                     if mother.get("join_mode") == "auto_accept_request"
                     else "主动邀请"
                 )
@@ -1589,10 +1857,14 @@ class TeamRotationController:
         try:
             from . import registrar
 
+            reauthorize_options = {
+                "proxy": self._options.get("proxy", ""),
+                "stop_event": self._stop_event,
+            }
+            if _preferred_seat_type(mother) == SEAT_TYPE_ADVANCED:
+                reauthorize_options["workspace_id"] = mother["workspace_id"]
             result = registrar.reauthorize_registered_account(
-                email,
-                proxy=self._options.get("proxy", ""),
-                stop_event=self._stop_event,
+                email, **reauthorize_options
             )
         except Exception as exc:
             result = {"ok": False, "error": str(exc)}
@@ -1710,7 +1982,12 @@ class TeamRotationController:
                         else assignment["email"]
                     ),
                     "account_id": mother["workspace_id"],
-                    "plan_type": "team",
+                    "plan_type": (
+                        "self_serve_business_prolite"
+                        if _preferred_seat_type(mother) == SEAT_TYPE_ADVANCED
+                        else "team"
+                    ),
+                    "seat_type": _preferred_seat_type(mother),
                     "notes": "Team 轮转",
                 },
                 cpa_cfg=None,
@@ -1753,6 +2030,8 @@ class TeamRotationController:
                 "refresh_token_invalidated",
                 "session has ended",
                 "refresh_token 失效",
+                "高级席位 oauth workspace 不匹配",
+                "高级席位 oauth plan 不匹配",
             ))
             if allow_reauthorize and auth_invalid:
                 self._event(

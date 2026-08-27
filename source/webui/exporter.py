@@ -508,6 +508,37 @@ def export_to_cpa(cred: dict, cfg: dict, *,
 # ──────────────────────── SUB2API：构建 payload ────────────────────────
 
 
+def _is_team_plan(value: Any) -> bool:
+    return str(value or "").strip().lower() in {
+        "team",
+        "business",
+        "enterprise",
+        "edu",
+        "self_serve_business_prolite",
+    }
+
+
+def _verify_advanced_workspace_oauth(cred: dict) -> None:
+    expected_plan = str(cred.get("plan_type") or "").strip().lower()
+    if expected_plan != "self_serve_business_prolite":
+        return
+    expected_workspace = str(cred.get("account_id") or "").strip()
+    auth = _get_auth(_decode_jwt_payload(str(cred.get("access_token") or "")))
+    actual_workspace = str(auth.get("chatgpt_account_id") or "").strip()
+    actual_plan = str(auth.get("chatgpt_plan_type") or "").strip().lower()
+    if actual_workspace != expected_workspace:
+        raise RuntimeError(
+            "高级席位 OAuth workspace 不匹配: "
+            f"expected={expected_workspace or 'missing'} "
+            f"actual={actual_workspace or 'missing'}"
+        )
+    if actual_plan != "self_serve_business_prolite":
+        raise RuntimeError(
+            "高级席位 OAuth plan 不匹配: "
+            f"expected=self_serve_business_prolite actual={actual_plan or 'missing'}"
+        )
+
+
 def build_sub2api_payload(
     cred: dict,
     group_ids: list[int],
@@ -610,12 +641,15 @@ def build_sub2api_payload(
     extra: dict[str, Any] = {}
     if mode != "off":
         extra["codex_fingerprint_mode"] = mode
-    if plan_type.lower() == "team" and chatgpt_account_id:
+    if _is_team_plan(plan_type) and chatgpt_account_id:
         extra.update({
             "openai_team_rotation_managed": True,
             "openai_team_workspace_id": chatgpt_account_id,
-            "openai_team_plan_type": "team",
+            "openai_team_plan_type": plan_type.lower(),
         })
+        seat_type = str(cred.get("seat_type") or "").strip().lower()
+        if seat_type in {"standard", "advanced"}:
+            extra["openai_team_seat_type"] = seat_type
     if extra:
         account["extra"] = extra
     return account
@@ -1062,6 +1096,7 @@ def get_sub2api_account_status(
     account_id: Any,
     *,
     expected_workspace_id: str = "",
+    expected_plan_type: str = "",
 ) -> dict:
     """读取一个 Hub 账号的调度状态，不调用 ChatGPT 余额接口。
 
@@ -1224,7 +1259,13 @@ def get_sub2api_account_status(
     if expected_workspace:
         actual_workspace = str(credentials.get("chatgpt_account_id") or "").strip()
         actual_plan = str(credentials.get("plan_type") or "").strip().lower()
-        if actual_workspace != expected_workspace or actual_plan != "team":
+        expected_plan = str(expected_plan_type or "team").strip().lower()
+        plan_matches = (
+            actual_plan == expected_plan
+            if expected_plan != "team"
+            else actual_plan == "team"
+        )
+        if actual_workspace != expected_workspace or not plan_matches:
             return {
                 "ok": True,
                 "classification": "team_mismatch",
@@ -1232,7 +1273,8 @@ def get_sub2api_account_status(
                 "account": data,
                 "error": (
                     "Sub2API Team 路由被覆盖: "
-                    f"plan_type={actual_plan or 'missing'}, "
+                    f"plan_type={actual_plan or 'missing'} "
+                    f"(expected={expected_plan}), "
                     f"workspace={actual_workspace or 'missing'}"
                 ),
             }
@@ -1352,6 +1394,7 @@ def run_exports(cred: dict, *,
             "refresh_token": fresh.get("refresh_token") or cred.get("refresh_token"),
             "id_token":      fresh.get("id_token") or cred.get("id_token", ""),
         }
+        _verify_advanced_workspace_oauth(cred)
         if token_update_fn is not None:
             try:
                 token_update_fn({

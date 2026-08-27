@@ -2746,6 +2746,11 @@ class AuthFlow:
 
     def _extract_workspace_id(self) -> str:
         """从 cookie 中提取 workspace_id"""
+        target_workspace_id = self._get_env(
+            "OAUTH_TARGET_WORKSPACE_ID", ""
+        ).strip()
+        if target_workspace_id:
+            return target_workspace_id
         try:
             auth_session = self._get_cookie_value_by_name(
                 "oai-client-auth-session", host="auth.openai.com"

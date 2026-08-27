@@ -182,11 +182,11 @@ function checkNow() {
 const motherDialog = ref(false)
 const motherSaving = ref(false)
 const editingId = ref('')
-const motherForm = reactive({ name: '', workspace_id: '', session: '', enabled: true, join_mode: 'invite_accept' })
+const motherForm = reactive({ name: '', workspace_id: '', session: '', enabled: true, join_mode: 'invite_accept', preferred_seat_type: 'standard' })
 
 function openCreate() {
   editingId.value = ''
-  Object.assign(motherForm, { name: '', workspace_id: '', session: '', enabled: true, join_mode: 'invite_accept' })
+  Object.assign(motherForm, { name: '', workspace_id: '', session: '', enabled: true, join_mode: 'invite_accept', preferred_seat_type: 'standard' })
   motherDialog.value = true
 }
 
@@ -198,6 +198,7 @@ function openEdit(row) {
     session: '',
     enabled: row.enabled,
     join_mode: row.join_mode || 'invite_accept',
+    preferred_seat_type: row.preferred_seat_type || 'standard',
   })
   motherDialog.value = true
 }
@@ -217,7 +218,8 @@ async function saveMother() {
       name: motherForm.name.trim(),
       workspace_id: motherForm.workspace_id.trim(),
       enabled: motherForm.enabled,
-      join_mode: motherForm.join_mode,
+      join_mode: motherForm.preferred_seat_type === 'advanced' ? 'auto_accept_request' : motherForm.join_mode,
+      preferred_seat_type: motherForm.preferred_seat_type,
     }
     if (motherForm.session.trim()) payload.session = motherForm.session.trim()
     if (editingId.value) await updateTeamMother(editingId.value, payload)
@@ -230,6 +232,23 @@ async function saveMother() {
   } finally {
     motherSaving.value = false
   }
+}
+
+function setAdvancedSeat(enabled) {
+  motherForm.preferred_seat_type = enabled ? 'advanced' : 'standard'
+  if (enabled) motherForm.join_mode = 'auto_accept_request'
+}
+
+function seatPool(row, type) {
+  const pool = row?.seat_capacity?.[type]
+  return pool && typeof pool === 'object' ? pool : {}
+}
+
+function seatTypeLabel(value) {
+  const normalized = String(value || '').toLowerCase()
+  if (['advanced', 'prolite', 'premium'].includes(normalized)) return '高级席位'
+  if (['standard', 'default', 'regular'].includes(normalized)) return '普通席位'
+  return '待识别'
 }
 
 async function toggleMother(row, enabled) {
@@ -371,11 +390,19 @@ onBeforeUnmount(() => window.clearInterval(pollTimer))
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="席位" width="150">
+        <el-table-column label="目标席位" width="105">
           <template #default="{ row }">
-            <span v-if="row.seats_entitled !== null && row.seats_entitled !== undefined">
-              {{ row.seats_in_use || 0 }} / {{ row.seats_entitled }} · 余 {{ row.seats_remaining || 0 }}
-            </span>
+            <el-tag :type="row.preferred_seat_type === 'advanced' ? 'primary' : 'info'" effect="light">
+              {{ row.preferred_seat_type === 'advanced' ? '高级' : '普通' }}
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="席位" width="210">
+          <template #default="{ row }">
+            <div v-if="row.seats_entitled !== null && row.seats_entitled !== undefined" class="seat-pools">
+              <span>普通 {{ seatPool(row, 'standard').assigned || 0 }}/{{ seatPool(row, 'standard').paid || 0 }} · 余 {{ seatPool(row, 'standard').available || 0 }}</span>
+              <span :class="{ advanced: row.preferred_seat_type === 'advanced' }">高级 {{ seatPool(row, 'advanced').assigned || 0 }}/{{ seatPool(row, 'advanced').paid || 0 }} · 余 {{ seatPool(row, 'advanced').available || 0 }}</span>
+            </div>
             <span v-else>-</span>
           </template>
         </el-table-column>
@@ -459,10 +486,18 @@ onBeforeUnmount(() => window.clearInterval(pollTimer))
           <el-input v-model="motherForm.session" type="textarea" :rows="7" resize="vertical" />
         </el-form-item>
         <el-form-item label="子号加入方式">
-          <el-radio-group v-model="motherForm.join_mode">
+          <el-radio-group v-model="motherForm.join_mode" :disabled="motherForm.preferred_seat_type === 'advanced'">
             <el-radio-button value="invite_accept">主动邀请</el-radio-button>
             <el-radio-button value="auto_accept_request">无需审核</el-radio-button>
           </el-radio-group>
+        </el-form-item>
+        <el-form-item label="高级席位">
+          <el-switch
+            :model-value="motherForm.preferred_seat_type === 'advanced'"
+            active-text="开启"
+            inactive-text="关闭"
+            @change="setAdvancedSeat"
+          />
         </el-form-item>
         <el-form-item label="启用"><el-switch v-model="motherForm.enabled" /></el-form-item>
       </el-form>
@@ -476,13 +511,14 @@ onBeforeUnmount(() => window.clearInterval(pollTimer))
       <div class="detail-summary">
         <span>总席位 <strong>{{ detail.seats.entitled ?? '-' }}</strong></span>
         <span>已使用 <strong>{{ detail.seats.in_use ?? '-' }}</strong></span>
-        <span>剩余 <strong>{{ detail.seats.remaining_default ?? '-' }}</strong></span>
+        <span>普通剩余 <strong>{{ detail.seats.remaining_standard ?? '-' }}</strong></span>
+        <span>高级剩余 <strong>{{ detail.seats.remaining_advanced ?? '-' }}</strong></span>
       </div>
       <el-table v-loading="detailLoading" :data="paginatedDetailMembers" stripe max-height="520" empty-text="暂无成员">
         <el-table-column prop="email" label="邮箱" min-width="220" show-overflow-tooltip />
         <el-table-column prop="name" label="名称" min-width="150" show-overflow-tooltip />
         <el-table-column prop="role" label="角色" width="130" />
-        <el-table-column prop="seat_type" label="席位类型" width="120" />
+        <el-table-column label="席位类型" width="120"><template #default="{ row }">{{ seatTypeLabel(row.seat_type) }}</template></el-table-column>
         <el-table-column label="操作" width="90" fixed="right">
           <template #default="{ row }">
             <el-button text type="danger" :icon="Delete" :disabled="row.is_owner" @click="kickMember(row)">移出</el-button>
@@ -506,6 +542,8 @@ onBeforeUnmount(() => window.clearInterval(pollTimer))
 .table-footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding-top: 14px; }
 .table-hint { color: var(--el-text-color-secondary); font-size: 12px; font-variant-numeric: tabular-nums; }
 .detail-footer { margin-top: 12px; }
+.seat-pools { display: grid; gap: 2px; color: var(--el-text-color-secondary); font-size: 12px; line-height: 1.35; }
+.seat-pools .advanced { color: var(--el-color-primary); font-weight: 600; }
 .control-grid { display: grid; grid-template-columns: 190px 140px 140px minmax(260px, 1fr); gap: 0 16px; align-items: end; }
 .control-grid :deep(.el-form-item) { margin-bottom: 12px; }
 .control-grid :deep(.control-field) { display: block; }
