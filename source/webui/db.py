@@ -1217,6 +1217,21 @@ def list_registered(limit: int = 20, offset: int = 0, filter_rt: str = "all") ->
     return rows
 
 
+def list_registered_emails(limit: int = 100000) -> list[str]:
+    """Return active registered emails without loading credential material."""
+    con = _conn()
+    try:
+        rows = con.execute(
+            "SELECT email FROM registered "
+            "WHERE coalesce(deleted_at, 0)=0 "
+            "ORDER BY created_at DESC LIMIT ?",
+            (max(1, min(int(limit or 100000), 100000)),),
+        ).fetchall()
+    finally:
+        con.close()
+    return [str(row["email"]).strip().lower() for row in rows if row["email"]]
+
+
 def list_registered_full(limit: int = 5000, filter_rt: str = "all") -> list[dict]:
     """返回完整凭证（用于批量导出）。每行同 get_registered 的格式。"""
     con = _conn()
@@ -2344,6 +2359,43 @@ def delete_all_registered() -> int:
         rc = con.execute("DELETE FROM registered")
         con.commit()
         return rc.rowcount
+
+
+def delete_banned_registered() -> int:
+    """Delete only active accounts whose latest persisted check says banned."""
+    with _lock:
+        con = _conn()
+        try:
+            rows = con.execute(
+                "SELECT email, extra_json FROM registered "
+                "WHERE coalesce(deleted_at, 0)=0 "
+                "AND extra_json LIKE '%\"plus_check\"%'"
+            ).fetchall()
+            banned = []
+            for row in rows:
+                try:
+                    extra = json.loads(row["extra_json"] or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                plus_check = extra.get("plus_check")
+                if isinstance(plus_check, dict) and plus_check.get("status") == "banned":
+                    banned.append(str(row["email"]).strip().lower())
+            if not banned:
+                return 0
+            total = 0
+            for index in range(0, len(banned), 500):
+                part = banned[index:index + 500]
+                placeholders = ",".join("?" * len(part))
+                cur = con.execute(
+                    f"DELETE FROM registered WHERE coalesce(deleted_at, 0)=0 "
+                    f"AND email IN ({placeholders})",
+                    part,
+                )
+                total += cur.rowcount
+            con.commit()
+            return total
+        finally:
+            con.close()
 
 
 def soft_delete_registered_by_emails(emails: list[str]) -> int:

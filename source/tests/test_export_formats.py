@@ -119,6 +119,43 @@ class ExportFormatsTest(unittest.TestCase):
         finally:
             db.DB_PATH = original_path
 
+    def test_registered_email_scan_and_delete_banned_only(self):
+        original_path = db.DB_PATH
+        try:
+            with TemporaryDirectory() as tmp:
+                db.DB_PATH = Path(tmp) / "webui.db"
+                db.init_db()
+                db.save_registered({
+                    "email": "banned@example.com",
+                    "access_token": "banned-at",
+                })
+                db.save_registered({
+                    "email": "free@example.com",
+                    "access_token": "free-at",
+                })
+                db.save_registered({
+                    "email": "unchecked@example.com",
+                    "access_token": "unchecked-at",
+                })
+                db.update_plus_check(
+                    "banned@example.com", {"status": "banned", "label": "封号"}
+                )
+                db.update_plus_check(
+                    "free@example.com", {"status": "free", "label": "Free"}
+                )
+
+                self.assertEqual(
+                    set(db.list_registered_emails()),
+                    {"banned@example.com", "free@example.com", "unchecked@example.com"},
+                )
+                self.assertEqual(db.delete_banned_registered(), 1)
+                self.assertIsNone(db.get_registered("banned@example.com"))
+                self.assertIsNotNone(db.get_registered("free@example.com"))
+                self.assertIsNotNone(db.get_registered("unchecked@example.com"))
+                self.assertEqual(db.delete_banned_registered(), 0)
+        finally:
+            db.DB_PATH = original_path
+
 
 if __name__ == "__main__":
     unittest.main()

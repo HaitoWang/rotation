@@ -4,7 +4,7 @@ import { storeToRefs } from 'pinia'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   listRegistered, getRegistered, deleteRegistered,
-  bulkDeleteRegistered, checkPlus,
+  bulkDeleteRegistered, deleteBannedRegistered, checkPlus,
   listExportFormats, exportRegistered, updateCredentials, reauthorizeRegistered,
   bulkReauthorizeRegistered,
 } from '@/api/register'
@@ -24,6 +24,7 @@ const filter = ref('all')
 const selected = ref([])
 const loading = ref(false)
 const checking = ref(false)
+const deletingBanned = ref(false)
 const checkResult = ref('')
 const reauthorizing = ref('')
 const batchReauthorizing = ref(false)
@@ -53,6 +54,19 @@ function collectEmails(mode) {
   return rows.value.map((r) => r.email) // all（当前页）
 }
 
+function applyCheckResults(results = {}) {
+  let plus = 0, free = 0, banned = 0, failed = 0
+  for (const [email, info] of Object.entries(results)) {
+    const row = rows.value.find((r) => r.email === email)
+    if (row) row.plus_check = info
+    if (info.status === 'plus_eligible' || info.status === 'plus_active') plus++
+    else if (info.status === 'banned') banned++
+    else if (info.status === 'free') free++
+    else if (info.status === 'error' || info.status === 'no_at' || info.status === 'not_found') failed++
+  }
+  return { plus, free, banned, failed }
+}
+
 async function doCheck(mode) {
   const emails = collectEmails(mode)
   if (!emails.length) { ElMessage.info('当前页没有可检测的号'); return }
@@ -60,15 +74,7 @@ async function doCheck(mode) {
   checkResult.value = `检查中... (${emails.length} 个)`
   try {
     const { results, note } = await checkPlus(emails, form.value.proxy.trim())
-    let plus = 0, free = 0, banned = 0, failed = 0
-    for (const [email, info] of Object.entries(results)) {
-      const row = rows.value.find((r) => r.email === email)
-      if (row) row.plus_check = info
-      if (info.status === 'plus_eligible' || info.status === 'plus_active') plus++
-      else if (info.status === 'banned') banned++
-      else if (info.status === 'free') free++
-      else if (info.status === 'error') failed++
-    }
+    const { plus, free, banned, failed } = applyCheckResults(results)
     // failed 和 note 都不入库，只是这一次的现场说明：
     // 以前网络/代理挂了这里只会显示「0 可用Plus, 0 Free, 0 封号」，看不出是没检测成。
     const parts = [`完成: ${plus} 可用Plus, ${free} Free, ${banned} 封号`]
@@ -78,6 +84,25 @@ async function doCheck(mode) {
   } catch (e) {
     checkResult.value = ''
     ElMessage.error('检查失败: ' + e.message)
+  } finally { checking.value = false }
+}
+
+async function checkAllAccounts() {
+  if (checking.value) return
+  checking.value = true
+  checkResult.value = '全量检测中...（会检查所有未删除账号）'
+  try {
+    const { results, note, summary } = await checkPlus([], form.value.proxy.trim(), true)
+    const counts = applyCheckResults(results)
+    const totalChecked = summary?.total ?? Object.keys(results || {}).length
+    const parts = [`全量完成: ${totalChecked} 个，${counts.plus} 个Plus，${counts.free} 个Free，${counts.banned} 个封号`]
+    if (counts.failed) parts.push(`${counts.failed} 个未完成`)
+    if (note) parts.push(note)
+    checkResult.value = parts.join(' · ')
+    await load()
+  } catch (e) {
+    checkResult.value = ''
+    ElMessage.error('全量检测失败: ' + e.message)
   } finally { checking.value = false }
 }
 
@@ -102,6 +127,20 @@ async function deleteAll() {
   if (!(await confirm('再次确认：真的要删除全部凭证吗？此操作不可恢复！'))) return
   try { const r = await bulkDeleteRegistered({ all: true }); ElMessage.success(`已清空 ${r.deleted} 条`); load() }
   catch (e) { ElMessage.error(e.message) }
+}
+
+async function deleteBanned() {
+  if (deletingBanned.value) return
+  if (!(await confirm('只删除最近检测明确标记为“封号”的账号，其他账号不会受影响。确定？'))) return
+  deletingBanned.value = true
+  try {
+    const result = await deleteBannedRegistered()
+    selected.value = []
+    ElMessage.success(result.deleted ? `已删除 ${result.deleted} 个封号账号` : '没有可删除的封号账号')
+    await load(true)
+  } catch (e) {
+    ElMessage.error('删除封号失败: ' + e.message)
+  } finally { deletingBanned.value = false }
 }
 
 async function reauthorize(row) {
@@ -404,6 +443,12 @@ onActivated(() => load())
             </el-dropdown-menu>
           </template>
         </el-dropdown>
+        <el-button type="warning" plain :loading="checking" :disabled="deletingBanned" @click="checkAllAccounts">
+          <el-icon><RefreshRight /></el-icon>一键检测全量
+        </el-button>
+        <el-button type="danger" plain :loading="deletingBanned" :disabled="checking" @click="deleteBanned">
+          <el-icon><Delete /></el-icon>删除所有封号
+        </el-button>
         <span class="toolbar-spacer" />
         <span v-if="selected.length" class="selected-badge">已选择 {{ selected.length }} 项</span>
         <el-button

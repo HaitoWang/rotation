@@ -394,6 +394,12 @@ class BulkDeleteRegisteredReq(BaseModel):
     all: bool = False
 
 
+class DeleteBannedRegisteredReq(BaseModel):
+    """Delete only accounts with a persisted, explicit banned check result."""
+
+    confirm: bool = False
+
+
 @app.post("/api/registered/bulk_delete")
 def api_bulk_delete_registered(req: BulkDeleteRegisteredReq):
     if req.all:
@@ -403,6 +409,14 @@ def api_bulk_delete_registered(req: BulkDeleteRegisteredReq):
         n = db.delete_registered_by_emails(req.emails)
         return {"ok": True, "deleted": n, "by": "emails"}
     raise HTTPException(400, "需要 emails 或 all=true")
+
+
+@app.post("/api/registered/delete_banned")
+def api_delete_banned_registered(req: DeleteBannedRegisteredReq):
+    if not req.confirm:
+        raise HTTPException(400, "需要 confirm=true")
+    deleted = db.delete_banned_registered()
+    return {"ok": True, "deleted": deleted, "by": "banned"}
 
 
 # ──────────────────────── 批量导出（文本） ────────────────────────
@@ -1089,8 +1103,9 @@ def api_bulk_reauthorize_registered(req: BulkReauthorizeRegisteredReq):
 
 
 class CheckPlusReq(BaseModel):
-    emails: list[str] = Field(..., description="要检查的邮箱列表")
+    emails: list[str] = Field(default_factory=list, description="要检查的邮箱列表")
     proxy: str = Field("", description="查询代理，留空直连")
+    all: bool = Field(False, description="检查全部未软删除账号")
 
 
 @app.post("/api/registered/check_plus")
@@ -1150,8 +1165,13 @@ def api_check_plus(req: CheckPlusReq):
             sess = _new_sess(None)
             return sess.get(url, headers=headers, timeout=15)
 
+    emails = (
+        db.list_registered_emails()
+        if req.all
+        else list(dict.fromkeys(str(email).strip().lower() for email in req.emails if str(email).strip()))
+    )
     results = {}
-    for email in req.emails:
+    for email in emails:
         cred = db.get_registered(email)
         if not cred:
             results[email] = {"status": "not_found", "label": "未找到"}
@@ -1211,7 +1231,13 @@ def api_check_plus(req: CheckPlusReq):
         if info["status"] not in ("not_found", "no_at", "error"):
             db.update_plus_check(email, {**info, "checked_at": checked_at})
 
-    return {"ok": True, "results": results, "note": note}
+    summary = {
+        "total": len(results),
+        "checked": sum(1 for info in results.values() if info.get("status") not in {"not_found", "no_at", "error"}),
+        "banned": sum(1 for info in results.values() if info.get("status") == "banned"),
+        "errors": sum(1 for info in results.values() if info.get("status") in {"not_found", "no_at", "error"}),
+    }
+    return {"ok": True, "results": results, "note": note, "summary": summary}
 
 
 # ──────────────────────── auto-loop ────────────────────────

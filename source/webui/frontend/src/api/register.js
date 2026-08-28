@@ -37,12 +37,15 @@ export const bulkReauthorizeRegistered = (emails, proxy = '', concurrency = 2) =
 export const bulkDeleteRegistered = (payload) =>
   http.post('/api/registered/bulk_delete', payload) // { emails } 或 { all: true }
 
+export const deleteBannedRegistered = () =>
+  http.post('/api/registered/delete_banned', { confirm: true })
+
 // 批量导出：格式清单由后端 export_formats.py 提供，加格式前端不用改
 export const listExportFormats = () => http.get('/api/registered/export/formats')
 export const exportRegistered = (payload) => http.post('/api/registered/export', payload)
 
-export const checkPlus = (emails, proxy = '') =>
-  http.post('/api/registered/check_plus', { emails, proxy })
+export const checkPlus = (emails = [], proxy = '', all = false) =>
+  http.post('/api/registered/check_plus', { emails, proxy, all })
 
 export const exportToPanel = (email, targets) =>
   http.post('/api/registered/export_to_panel', { email, targets })

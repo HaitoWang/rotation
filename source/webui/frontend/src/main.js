@@ -12,7 +12,7 @@ import {
   Platform, Fold, Expand, Moon, Sunny, User, ArrowDown,
   Odometer, Upload, VideoPlay, MagicStick, Connection, Files,
   CircleCheck, Document, Message, Iphone, Share,
-  Loading, Select, CircleClose, Refresh, CopyDocument,
+  Loading, Select, CircleClose, Refresh, CopyDocument, Delete,
   Download, Search, Menu, ArrowRight, Plus,
 } from '@element-plus/icons-vue'
 
@@ -23,7 +23,7 @@ const ICONS = {
   Platform, Fold, Expand, Moon, Sunny, User, ArrowDown,
   Odometer, Upload, VideoPlay, MagicStick, Connection, Files,
   CircleCheck, Document, Message, Iphone, Share,
-  Loading, Select, CircleClose, Refresh, CopyDocument,
+  Loading, Select, CircleClose, Refresh, CopyDocument, Delete,
   Download, Search, Menu, ArrowRight, Plus,
 }
 
