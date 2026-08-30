@@ -1,7 +1,7 @@
 import unittest
 from unittest import mock
 
-from app.auth_flow import AuthFlow
+from app.integrations.openai.auth_flow import AuthFlow
 
 
 class AuthSessionRetryTests(unittest.TestCase):

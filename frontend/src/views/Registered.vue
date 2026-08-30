@@ -4,8 +4,9 @@ import { storeToRefs } from 'pinia'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   listRegistered, getRegistered, deleteRegistered,
-  bulkDeleteRegistered, checkPlus,
-  listExportFormats, exportRegistered, updateCredentials,
+  bulkDeleteRegistered, deleteBannedRegistered, checkPlus,
+  listExportFormats, exportRegistered, updateCredentials, reauthorizeRegistered,
+  bulkReauthorizeRegistered,
 } from '@/api/register'
 import { copyText, fmtTime } from '@/api/request'
 import { useFormStore } from '@/stores/form'
@@ -23,7 +24,10 @@ const filter = ref('all')
 const selected = ref([])
 const loading = ref(false)
 const checking = ref(false)
+const deletingBanned = ref(false)
 const checkResult = ref('')
+const reauthorizing = ref('')
+const batchReauthorizing = ref(false)
 
 const PLUS_TYPE = {
   plus_eligible: 'success', plus_active: 'primary', free: 'warning',
@@ -50,6 +54,19 @@ function collectEmails(mode) {
   return rows.value.map((r) => r.email) // all（当前页）
 }
 
+function applyCheckResults(results = {}) {
+  let plus = 0, free = 0, banned = 0, failed = 0
+  for (const [email, info] of Object.entries(results)) {
+    const row = rows.value.find((r) => r.email === email)
+    if (row) row.plus_check = info
+    if (info.status === 'plus_eligible' || info.status === 'plus_active') plus++
+    else if (info.status === 'banned') banned++
+    else if (info.status === 'free') free++
+    else if (info.status === 'error' || info.status === 'no_at' || info.status === 'not_found') failed++
+  }
+  return { plus, free, banned, failed }
+}
+
 async function doCheck(mode) {
   const emails = collectEmails(mode)
   if (!emails.length) { ElMessage.info('当前页没有可检测的号'); return }
@@ -57,15 +74,7 @@ async function doCheck(mode) {
   checkResult.value = `检查中... (${emails.length} 个)`
   try {
     const { results, note } = await checkPlus(emails, form.value.proxy.trim())
-    let plus = 0, free = 0, banned = 0, failed = 0
-    for (const [email, info] of Object.entries(results)) {
-      const row = rows.value.find((r) => r.email === email)
-      if (row) row.plus_check = info
-      if (info.status === 'plus_eligible' || info.status === 'plus_active') plus++
-      else if (info.status === 'banned') banned++
-      else if (info.status === 'free') free++
-      else if (info.status === 'error') failed++
-    }
+    const { plus, free, banned, failed } = applyCheckResults(results)
     // failed 和 note 都不入库，只是这一次的现场说明：
     // 以前网络/代理挂了这里只会显示「0 可用Plus, 0 Free, 0 封号」，看不出是没检测成。
     const parts = [`完成: ${plus} 可用Plus, ${free} Free, ${banned} 封号`]
@@ -75,6 +84,25 @@ async function doCheck(mode) {
   } catch (e) {
     checkResult.value = ''
     ElMessage.error('检查失败: ' + e.message)
+  } finally { checking.value = false }
+}
+
+async function checkAllAccounts() {
+  if (checking.value) return
+  checking.value = true
+  checkResult.value = '全量检测中...（会检查所有未删除账号）'
+  try {
+    const { results, note, summary } = await checkPlus([], form.value.proxy.trim(), true)
+    const counts = applyCheckResults(results)
+    const totalChecked = summary?.total ?? Object.keys(results || {}).length
+    const parts = [`全量完成: ${totalChecked} 个，${counts.plus} 个Plus，${counts.free} 个Free，${counts.banned} 个封号`]
+    if (counts.failed) parts.push(`${counts.failed} 个未完成`)
+    if (note) parts.push(note)
+    checkResult.value = parts.join(' · ')
+    await load()
+  } catch (e) {
+    checkResult.value = ''
+    ElMessage.error('全量检测失败: ' + e.message)
   } finally { checking.value = false }
 }
 
@@ -95,10 +123,91 @@ async function deleteSelected() {
   catch (e) { ElMessage.error(e.message) }
 }
 async function deleteAll() {
-  if (!(await confirm('这会清空注册结果表里的所有凭证！邮箱列表不受影响，确定？'))) return
+  if (!(await confirm('这会清空账号池里的所有凭证！邮箱列表不受影响，确定？'))) return
   if (!(await confirm('再次确认：真的要删除全部凭证吗？此操作不可恢复！'))) return
   try { const r = await bulkDeleteRegistered({ all: true }); ElMessage.success(`已清空 ${r.deleted} 条`); load() }
   catch (e) { ElMessage.error(e.message) }
+}
+
+async function deleteBanned() {
+  if (deletingBanned.value) return
+  if (!(await confirm('只删除最近检测明确标记为“封号”的账号，其他账号不会受影响。确定？'))) return
+  deletingBanned.value = true
+  try {
+    const result = await deleteBannedRegistered()
+    selected.value = []
+    ElMessage.success(result.deleted ? `已删除 ${result.deleted} 个封号账号` : '没有可删除的封号账号')
+    await load(true)
+  } catch (e) {
+    ElMessage.error('删除封号失败: ' + e.message)
+  } finally { deletingBanned.value = false }
+}
+
+async function reauthorize(row) {
+  try {
+    await ElMessageBox.confirm(
+      `重新授权 ${row.email}？\n\n流程可能需要邮箱验证码或 2FA，并会刷新 Access、Session 和 Codex Refresh Token。`,
+      '账号重授权',
+      { type: 'warning', confirmButtonText: '开始重授权', cancelButtonText: '取消' },
+    )
+  } catch { return }
+
+  reauthorizing.value = row.email
+  try {
+    const result = await reauthorizeRegistered(row.email, form.value.proxy.trim())
+    ElMessage.success(
+      `重授权成功：AT ${result.access_token_len} / ST ${result.session_token_len} / RT ${result.refresh_token_len}`,
+    )
+    await load()
+  } catch (e) {
+    ElMessage.error('重授权失败: ' + e.message)
+  } finally {
+    reauthorizing.value = ''
+  }
+}
+
+async function reauthorizeSelected() {
+  const emails = selected.value.map((row) => row.email)
+  if (!emails.length) return
+  try {
+    await ElMessageBox.confirm(
+      `批量重新授权选中的 ${emails.length} 个账号？\n\n` +
+      '默认同时处理 2 个账号，过程中可能需要邮箱验证码、2FA 或手机号接码。',
+      '批量重授权',
+      { type: 'warning', confirmButtonText: '开始批量重授权', cancelButtonText: '取消' },
+    )
+  } catch { return }
+
+  batchReauthorizing.value = true
+  try {
+    const result = await bulkReauthorizeRegistered(
+      emails,
+      form.value.proxy.trim(),
+      2,
+    )
+    await load()
+    if (!result.failed) {
+      ElMessage.success(`批量重授权完成：成功 ${result.success} 个`)
+      return
+    }
+
+    const failures = (result.results || []).filter((item) => !item.ok)
+    const visible = failures.slice(0, 20).map(
+      (item) => `${item.email}: ${item.error || '未知错误'}`,
+    )
+    if (failures.length > visible.length) {
+      visible.push(`另有 ${failures.length - visible.length} 个失败，请到运行记录查看`)
+    }
+    await ElMessageBox.alert(
+      `成功 ${result.success} 个，失败 ${result.failed} 个。\n\n${visible.join('\n')}`,
+      '批量重授权完成',
+      { type: 'warning', confirmButtonText: '知道了' },
+    )
+  } catch (e) {
+    ElMessage.error('批量重授权失败: ' + e.message)
+  } finally {
+    batchReauthorizing.value = false
+  }
 }
 
 function handleDeleteCommand(command) {
@@ -289,8 +398,8 @@ onActivated(() => load())
       <template #header>
         <div class="panel-header">
           <div class="panel-title-group">
-            <h2 class="section-title">凭证列表</h2>
-            <p class="section-subtitle">共 {{ total }} 个已注册账号</p>
+            <h2 class="section-title">账号池</h2>
+            <p class="section-subtitle">共 {{ total }} 个账号，可检查、重授权和导出凭证</p>
           </div>
           <el-dropdown trigger="click" @command="doExport" @visible-change="(v) => v && loadExportFormats()">
             <el-button type="primary" :loading="exporting">
@@ -334,9 +443,24 @@ onActivated(() => load())
             </el-dropdown-menu>
           </template>
         </el-dropdown>
+        <el-button type="warning" plain :loading="checking" :disabled="deletingBanned" @click="checkAllAccounts">
+          <el-icon><RefreshRight /></el-icon>一键检测全量
+        </el-button>
+        <el-button type="danger" plain :loading="deletingBanned" :disabled="checking" @click="deleteBanned">
+          <el-icon><Delete /></el-icon>删除所有封号
+        </el-button>
         <span class="toolbar-spacer" />
         <span v-if="selected.length" class="selected-badge">已选择 {{ selected.length }} 项</span>
-        <el-dropdown trigger="click" @command="handleDeleteCommand">
+        <el-button
+          type="primary"
+          plain
+          :loading="batchReauthorizing"
+          :disabled="!selected.length || Boolean(reauthorizing)"
+          @click="reauthorizeSelected"
+        >
+          <el-icon><RefreshRight /></el-icon>批量重授权<span v-if="selected.length"> ({{ selected.length }})</span>
+        </el-button>
+        <el-dropdown trigger="click" :disabled="batchReauthorizing" @command="handleDeleteCommand">
           <el-button type="danger" plain>删除<el-icon class="el-icon--right"><ArrowDown /></el-icon></el-button>
           <template #dropdown>
             <el-dropdown-menu>
@@ -419,15 +543,27 @@ onActivated(() => load())
         <el-table-column label="时间" width="160">
           <template #default="{ row }">{{ fmtTime(row.created_at) }}</template>
         </el-table-column>
-        <el-table-column label="操作" width="200" fixed="right">
+        <el-table-column label="操作" width="280" fixed="right">
           <template #default="{ row }">
-            <el-button size="small" text @click="viewCred(row.email)">查看凭证</el-button>
-            <el-button size="small" text type="warning" @click="openEdit(row)">编辑</el-button>
-            <el-button size="small" text type="danger" @click="deleteOne(row.email)">删除</el-button>
+            <div class="row-actions">
+              <el-button size="small" text @click="viewCred(row.email)">查看凭证</el-button>
+              <el-button size="small" text type="warning" @click="openEdit(row)">编辑</el-button>
+              <el-button
+                size="small"
+                text
+                type="primary"
+                :loading="reauthorizing === row.email"
+                :disabled="batchReauthorizing || (Boolean(reauthorizing) && reauthorizing !== row.email)"
+                @click="reauthorize(row)"
+              >
+                <el-icon><RefreshRight /></el-icon>重授权
+              </el-button>
+              <el-button size="small" text type="danger" @click="deleteOne(row.email)">删除</el-button>
+            </div>
           </template>
         </el-table-column>
         <template #empty>
-          <el-empty description="暂无注册结果，去「单次注册」或「全自动批量」跑号" :image-size="70" />
+          <el-empty description="账号池暂无账号，去「单次注册」或「全自动批量」跑号" :image-size="70" />
         </template>
       </el-table>
       <div style="display: flex; justify-content: center; margin-top: 14px">
@@ -529,6 +665,12 @@ onActivated(() => load())
 <style scoped>
 .selected-badge { padding: 5px 9px; color: var(--brand); border-radius: 7px; background: var(--brand-soft); font-size: 11px; font-weight: 600; }
 .check-result { display: flex; align-items: center; gap: 7px; margin: -3px 0 13px; padding: 8px 10px; color: var(--el-text-color-regular); border-radius: 8px; background: var(--el-fill-color-lighter); font-size: 11px; }
+.row-actions { display: flex; flex-wrap: nowrap; align-items: center; gap: 4px; white-space: nowrap; }
+:deep(.row-actions .el-button + .el-button) { margin-left: 0; }
+:deep(.el-table td.el-table-fixed-column--right) { background: var(--el-bg-color); }
+:deep(.el-table__body tr.el-table__row--striped > td.el-table-fixed-column--right) { background: var(--el-table-tr-bg-color); }
+:deep(.el-table__body tr:hover > td.el-table-fixed-column--right),
+:deep(.el-table__body tr.el-table__row--striped:hover > td.el-table-fixed-column--right) { background: var(--el-table-row-hover-bg-color); }
 /* 表格里「点一下就复制」的明文单元格（密码 / 2FA secret）。
    :deep 是必需的：.el-button 由 Element Plus 渲染，scoped 的属性选择器打不到它。
 

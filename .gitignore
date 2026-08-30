@@ -6,8 +6,11 @@ secrets.json
 config.local.json
 
 # Runtime state and generated output
-state/
-outputs/
+backend/data/
+backend/outputs/
+backend/webui/logs/
+frontend/dist/
+frontend/node_modules/
 *.db
 *.db-*
 *.sqlite
@@ -16,12 +19,6 @@ outputs/
 account_*.json
 *.session
 *.token
-backend/data/
-backend/logs/
-source/data/.sms*
-source/webui/logs/
-backend/app/webui/static/
-
 # Python
 __pycache__/
 *.py[cod]

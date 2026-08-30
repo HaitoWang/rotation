@@ -1,0 +1,148 @@
+name: regert-gpt-outlook-register
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5432:5432"
+    environment:
+      POSTGRES_DB: "${POSTGRES_DB:-regert}"
+      POSTGRES_USER: "${POSTGRES_USER:-regert}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-regert}"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-regert} -d ${POSTGRES_DB:-regert}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6379:6379"
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  migrate:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        PYTHON_BASE_IMAGE: "${PYTHON_BASE_IMAGE:-python:3.11-slim-bookworm}"
+        NODE_BASE_IMAGE: "${NODE_BASE_IMAGE:-node:24-alpine}"
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: "${DATABASE_URL:-postgresql+asyncpg://regert:regert@postgres:5432/regert}"
+    command: ["alembic", "upgrade", "head"]
+
+  app:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        PYTHON_BASE_IMAGE: "${PYTHON_BASE_IMAGE:-python:3.11-slim-bookworm}"
+        NODE_BASE_IMAGE: "${NODE_BASE_IMAGE:-node:24-alpine}"
+    restart: unless-stopped
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    expose:
+      - "8765"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ../backend/data:/app/data
+      - ../backend/outputs:/app/outputs
+    environment:
+      OPENAI_SENTINEL_NODE_PATH: node
+      # 0 disables the artificial QuickJS queue; subprocess timeouts still bound each action.
+      OPENAI_SENTINEL_MAX_CONCURRENCY: "${OPENAI_SENTINEL_MAX_CONCURRENCY:-0}"
+      AUTH_HTTP_TRACE: "0"
+      AUTH_TRACE_DUMP: "0"
+      DATABASE_URL: "${DATABASE_URL:-postgresql+asyncpg://regert:regert@postgres:5432/regert}"
+      REDIS_URL: "${REDIS_URL:-redis://redis:6379/0}"
+      REDIS_QUEUE_NAME: "${REDIS_QUEUE_NAME:-regert}"
+      AUTO_CREATE_SCHEMA: "false"
+      SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
+      CURL_CA_BUNDLE: /etc/ssl/certs/ca-certificates.crt
+      REQUESTS_CA_BUNDLE: /etc/ssl/certs/ca-certificates.crt
+      FRONTEND_DIST_DIR: /app/frontend/dist
+      REGERT_DATA_DIR: /app/data
+      TEAM_SSO_SYNC_ENABLED: "${TEAM_SSO_SYNC_ENABLED:-0}"
+      TEAM_SSO_SYNC_URL: "${TEAM_SSO_SYNC_URL:-http://host.docker.internal:8088/api/internal/free-accounts/import}"
+      TEAM_SSO_SYNC_KEY: "${TEAM_SSO_SYNC_KEY:-}"
+      TEAM_SSO_ENABLED: "${TEAM_SSO_ENABLED:-false}"
+      TEAM_SSO_URL: "${TEAM_SSO_URL:-http://host.docker.internal:8088/api/internal/free-accounts/import}"
+      TEAM_ROTATION_ENABLED: "${TEAM_ROTATION_ENABLED:-false}"
+      TEAM_ROTATION_PROXY: "${TEAM_ROTATION_PROXY:-}"
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/healthz', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  worker:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        PYTHON_BASE_IMAGE: "${PYTHON_BASE_IMAGE:-python:3.11-slim-bookworm}"
+        NODE_BASE_IMAGE: "${NODE_BASE_IMAGE:-node:24-alpine}"
+    restart: unless-stopped
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    volumes:
+      - ../backend/data:/app/data
+      - ../backend/outputs:/app/outputs
+    environment:
+      DATABASE_URL: "${DATABASE_URL:-postgresql+asyncpg://regert:regert@postgres:5432/regert}"
+      REDIS_URL: "${REDIS_URL:-redis://redis:6379/0}"
+      REDIS_QUEUE_NAME: "${REDIS_QUEUE_NAME:-regert}"
+      OPENAI_SENTINEL_NODE_PATH: node
+      SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
+      CURL_CA_BUNDLE: /etc/ssl/certs/ca-certificates.crt
+      REQUESTS_CA_BUNDLE: /etc/ssl/certs/ca-certificates.crt
+      FRONTEND_DIST_DIR: /app/frontend/dist
+      REGERT_DATA_DIR: /app/data
+      TEAM_SSO_ENABLED: "${TEAM_SSO_ENABLED:-false}"
+      TEAM_SSO_URL: "${TEAM_SSO_URL:-http://host.docker.internal:8088/api/internal/free-accounts/import}"
+      TEAM_SSO_SYNC_KEY: "${TEAM_SSO_SYNC_KEY:-}"
+      TEAM_ROTATION_ENABLED: "${TEAM_ROTATION_ENABLED:-false}"
+      TEAM_ROTATION_PROXY: "${TEAM_ROTATION_PROXY:-}"
+    command: ["python", "-m", "app.worker"]
+
+  gateway:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    depends_on:
+      app:
+        condition: service_healthy
+    ports:
+      - "${WEBUI_BIND_ADDRESS:-127.0.0.1}:${WEBUI_PORT:-18765}:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+
+volumes:
+  postgres_data:
+  redis_data:

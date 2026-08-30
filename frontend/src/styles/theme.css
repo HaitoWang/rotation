@@ -1,48 +1,62 @@
-/* A quiet, Apple-inspired workspace theme built on top of Element Plus. */
+/* LoopHub workbench language: compact, neutral, and task-first. */
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Inter:wght@400;500;600;700&family=Manrope:wght@600;700;800&display=swap');
+
 :root {
-  --el-color-primary: #0878f9;
-  --el-color-primary-light-3: #50a0fb;
-  --el-color-primary-light-5: #83bbfc;
-  --el-color-primary-light-7: #b7d8fd;
-  --el-color-primary-light-8: #d3e7fe;
-  --el-color-primary-light-9: #eaf4ff;
-  --el-color-primary-dark-2: #0064d8;
-  --el-color-success: #28a745;
-  --el-color-warning: #d98500;
-  --el-color-danger: #e23b3b;
-  --el-border-radius-base: 8px;
-  --el-border-radius-small: 7px;
-  --el-component-size: 38px;
-  --brand: #0878f9;
-  --brand-dark: #0064d8;
-  --brand-soft: #eaf4ff;
-  --app-sidebar-bg: #fbfbfc;
-  --app-header-bg: rgba(255, 255, 255, .86);
-  --app-content-bg: #f4f5f7;
+  --el-color-primary: #356ae6;
+  --el-color-primary-light-3: #6c91ed;
+  --el-color-primary-light-5: #9bb4f3;
+  --el-color-primary-light-7: #c8d5fa;
+  --el-color-primary-light-8: #dfe7fc;
+  --el-color-primary-light-9: #edf3ff;
+  --el-color-primary-dark-2: #2455c6;
+  --el-color-success: #23856d;
+  --el-color-warning: #a66b18;
+  --el-color-danger: #b94e48;
+  --el-border-radius-base: 6px;
+  --el-border-radius-small: 5px;
+  --el-component-size: 36px;
+  --brand: #356ae6;
+  --brand-dark: #2455c6;
+  --brand-soft: #edf3ff;
+  --app-sidebar-bg: #fafafa;
+  --app-header-bg: rgba(255, 255, 255, .96);
+  --app-content-bg: #ffffff;
   --app-elevated-bg: #ffffff;
-  --app-border: rgba(27, 31, 36, .09);
-  --app-border-strong: rgba(27, 31, 36, .16);
-  --app-title: #17191c;
-  --app-log-bg: #17191d;
-  --app-log-text: #d8dbe2;
-  --app-shadow: 0 1px 2px rgba(20, 24, 31, .03), 0 8px 24px rgba(20, 24, 31, .04);
+  --app-border: #d8d8dc;
+  --app-border-strong: #c4c5ca;
+  --app-title: #262626;
+  --app-sidebar-text: #626262;
+  --app-sidebar-muted: #969696;
+  --app-hover-bg: #f0f0f1;
+  --app-active-bg: #e8e8ea;
+  --app-muted-bg: #f5f5f6;
+  --app-icon-bg: #f0f0f1;
+  --app-log-bg: #202124;
+  --app-log-text: #e0e1e5;
+  --app-shadow: none;
 }
 
 html.dark {
-  --el-color-primary: #3b93ff;
-  --el-color-primary-dark-2: #67aaff;
-  --brand: #3b93ff;
-  --brand-dark: #67aaff;
-  --brand-soft: rgba(59, 147, 255, .14);
+  --el-color-primary: #7f9ff1;
+  --el-color-primary-dark-2: #a7bcf6;
+  --brand: #7f9ff1;
+  --brand-dark: #a7bcf6;
+  --brand-soft: rgba(127, 159, 241, .15);
   --app-sidebar-bg: #191a1d;
-  --app-header-bg: rgba(25, 26, 29, .86);
-  --app-content-bg: #111215;
+  --app-header-bg: rgba(25, 26, 29, .96);
+  --app-content-bg: #111214;
   --app-elevated-bg: #1d1e22;
-  --app-border: rgba(255, 255, 255, .08);
-  --app-border-strong: rgba(255, 255, 255, .16);
-  --app-title: #f4f5f7;
-  --app-log-bg: #0e0f11;
-  --app-shadow: 0 1px 2px rgba(0, 0, 0, .12), 0 12px 30px rgba(0, 0, 0, .12);
+  --app-border: rgba(255, 255, 255, .1);
+  --app-border-strong: rgba(255, 255, 255, .18);
+  --app-title: #f2f3f5;
+  --app-sidebar-text: #c1c4ca;
+  --app-sidebar-muted: #92969e;
+  --app-hover-bg: #282a2f;
+  --app-active-bg: #303238;
+  --app-muted-bg: #24262b;
+  --app-icon-bg: #2a2c31;
+  --app-log-bg: #202124;
+  --app-shadow: none;
 }
 
 * { box-sizing: border-box; }
@@ -52,48 +66,48 @@ body {
   overflow: hidden;
   color: var(--el-text-color-primary);
   background: var(--app-content-bg);
-  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", "PingFang SC", "Microsoft YaHei", sans-serif;
+  font-family: Inter, "DM Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
 }
 button, input, textarea, select { font: inherit; }
 
 /* Navigation */
 .side-menu .el-menu-item-group__title {
-  height: 30px;
-  padding: 10px 10px 5px !important;
-  color: var(--el-text-color-placeholder);
-  font-size: 10px;
-  font-weight: 650;
+  height: 26px;
+  padding: 7px 9px 4px !important;
+  color: var(--app-sidebar-muted);
+  font-size: 9px;
+  font-weight: 600;
   line-height: 15px;
 }
 .side-menu .el-menu-item {
-  height: 40px;
-  margin: 2px 0;
-  padding: 0 11px !important;
-  color: var(--el-text-color-regular);
-  border-radius: 8px;
-  font-size: 13px;
+  height: 34px;
+  margin: 1px 0;
+  padding: 0 9px !important;
+  color: var(--app-sidebar-text);
+  border-radius: 6px;
+  font-size: 11px;
 }
-.side-menu .el-menu-item .el-icon { color: var(--el-text-color-secondary); font-size: 17px; }
-.side-menu .el-menu-item:hover { color: var(--app-title); background: var(--el-fill-color-light); }
-.side-menu .el-menu-item.is-active { color: var(--brand); font-weight: 600; background: var(--brand-soft); }
-.side-menu .el-menu-item.is-active .el-icon { color: var(--brand); }
-.side-menu.el-menu--collapse { width: 56px; padding-inline: 8px; }
+.side-menu .el-menu-item .el-icon { color: var(--app-sidebar-muted); font-size: 15px; }
+.side-menu .el-menu-item:hover { color: var(--app-title); background: var(--app-hover-bg); }
+.side-menu .el-menu-item.is-active { color: var(--app-title); font-weight: 600; background: var(--app-active-bg); }
+.side-menu .el-menu-item.is-active .el-icon { color: var(--app-title); }
+.side-menu.el-menu--collapse { width: 56px; padding-inline: 4px; }
 .side-menu.el-menu--collapse .el-menu-item-group__title { display: none; }
 .side-menu.el-menu--collapse .el-menu-item { justify-content: center; padding: 0 !important; }
 
 /* Element Plus surface cleanup */
 .el-card {
   border-color: var(--app-border);
-  border-radius: 10px;
+  border-radius: 8px;
   background: var(--app-elevated-bg);
   box-shadow: var(--app-shadow);
 }
-.el-card__header { padding: 17px 18px; border-bottom-color: var(--app-border); }
-.el-card__body { padding: 18px; }
-.el-button { font-weight: 520; transition: transform .15s ease, background-color .15s ease, border-color .15s ease; }
-.el-button:not(.is-disabled):active { transform: scale(.97); }
-.el-button--primary:not(.is-plain) { box-shadow: 0 3px 9px rgba(8, 120, 249, .18); }
-.el-button.is-circle { width: 38px; height: 38px; }
+.el-card__header { padding: 15px 17px; border-bottom-color: var(--app-border); }
+.el-card__body { padding: 17px; }
+.el-button { font-weight: 550; transition: transform .15s ease, background-color .15s ease, border-color .15s ease; }
+.el-button:not(.is-disabled):active { transform: scale(.98); }
+.el-button--primary:not(.is-plain) { --el-button-bg-color: #252525; --el-button-border-color: #252525; --el-button-hover-bg-color: #000; --el-button-hover-border-color: #000; --el-button-active-bg-color: #000; --el-button-active-border-color: #000; box-shadow: none; }
+.el-button.is-circle { width: 34px; height: 34px; }
 .el-input__wrapper, .el-select__wrapper, .el-textarea__inner, .el-input-number {
   box-shadow: 0 0 0 1px var(--app-border-strong) inset !important;
   background: var(--app-elevated-bg);
@@ -101,18 +115,18 @@ button, input, textarea, select { font: inherit; }
 .el-input__wrapper:hover, .el-select__wrapper:hover, .el-textarea__inner:hover { box-shadow: 0 0 0 1px var(--el-text-color-placeholder) inset !important; }
 .el-input__wrapper.is-focus, .el-select__wrapper.is-focused, .el-textarea__inner:focus { box-shadow: 0 0 0 2px var(--brand) inset !important; }
 .el-textarea__inner { line-height: 1.6; }
-.el-form-item__label { color: var(--el-text-color-regular); font-size: 12px; font-weight: 560; }
+.el-form-item__label { color: var(--app-sidebar-text); font-size: 11px; font-weight: 600; }
 .el-form--label-top .el-form-item .el-form-item__label { margin-bottom: 6px; }
 .el-table { --el-table-border-color: var(--app-border); --el-table-header-bg-color: var(--el-fill-color-lighter); border-radius: 8px; }
-.el-table th.el-table__cell { height: 42px; color: var(--el-text-color-secondary); font-size: 11px; font-weight: 650; }
-.el-table td.el-table__cell { height: 46px; border-bottom-color: var(--app-border); }
+.el-table th.el-table__cell { height: 38px; color: #969696; font-size: 10px; font-weight: 600; }
+.el-table td.el-table__cell { height: 42px; border-bottom-color: var(--app-border); }
 .el-table .cell { line-height: 1.4; }
 .el-table--striped .el-table__body tr.el-table__row--striped td.el-table__cell { background: color-mix(in srgb, var(--el-fill-color-lighter) 54%, transparent); }
-.el-dialog { border-radius: 12px; box-shadow: 0 24px 80px rgba(0,0,0,.2); }
+.el-dialog { border-radius: 8px; box-shadow: 0 18px 50px rgba(24, 30, 45, .18); }
 .el-dialog__header { padding-bottom: 14px; border-bottom: 1px solid var(--app-border); }
 .el-dialog__title { font-size: 16px; font-weight: 650; }
 .el-alert { border-radius: 9px; }
-.el-tag { border-radius: 6px; font-weight: 520; }
+.el-tag { border-radius: 5px; font-weight: 550; }
 .el-pagination.is-background .btn-next,
 .el-pagination.is-background .btn-prev,
 .el-pagination.is-background .el-pager li { border-radius: 7px; }
@@ -120,12 +134,12 @@ button, input, textarea, select { font: inherit; }
 .el-loading-mask { border-radius: inherit; }
 
 /* Shared page language */
-.page { width: min(100%, 1600px); margin: 0 auto; padding: 0; }
+.page { width: min(100%, 1500px); margin: 0 auto; padding: 0; }
 .page > .el-card:last-child { margin-bottom: 0; }
 .page .el-card { margin-bottom: 16px; }
 .section-title { margin: 0; color: var(--app-title); font-size: 14px; font-weight: 650; }
-.section-subtitle { margin: 4px 0 0; color: var(--el-text-color-secondary); font-size: 12px; line-height: 1.5; }
-.hint { color: var(--el-text-color-secondary); font-size: 12px; line-height: 1.55; }
+.section-subtitle { margin: 4px 0 0; color: var(--app-sidebar-muted); font-size: 11px; line-height: 1.5; }
+.hint { color: var(--app-sidebar-text); font-size: 11px; line-height: 1.55; }
 .mono { font-family: "SFMono-Regular", ui-monospace, Menlo, Monaco, Consolas, monospace; }
 .panel-header { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
 .panel-title-group { min-width: 0; }
@@ -159,7 +173,7 @@ button, input, textarea, select { font: inherit; }
   padding: 13px 15px;
   color: var(--app-log-text);
   border: 1px solid var(--app-border);
-  border-radius: 8px;
+  border-radius: 6px;
   background: var(--app-log-bg);
   font-family: "SFMono-Regular", ui-monospace, Menlo, Consolas, monospace;
   font-size: 11px;

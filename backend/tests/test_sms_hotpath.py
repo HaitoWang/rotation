@@ -10,7 +10,7 @@ import time
 import unittest
 from unittest import mock
 
-from app import sms_provider
+import app.integrations.sms.provider as sms_provider
 
 
 class _CountingProvider:

@@ -7,7 +7,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from app.webui import two_factor
+from app.integrations.openai import totp as two_factor
 
 
 class _Response:

@@ -41,7 +41,7 @@ export default http
 
 /**
  * 建立一个 SSE 连接。
- * @param {string} path  相对路径，如 `/api/auto/stream`
+ * @param {string} path  相对路径，如 `/api/v1/runs/{run_id}/events`
  * @param {Object<string, (ev: MessageEvent)=>void>} handlers 事件名 -> 回调
  * @param {(err: Event)=>void} [onError] 出错回调（默认自动关闭）
  * @returns {EventSource}

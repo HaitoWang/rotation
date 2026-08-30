@@ -3,8 +3,18 @@
 # HTTP 客户端 + TLS 指纹模拟（Cloudflare 绕过的关键）
 curl-cffi>=0.7.0
 requests>=2.31.0
+certifi>=2024.8.30
 
 # WebUI（可选；只跑 register_outlook.py 命令行不需要）
 fastapi>=0.110.0
 uvicorn[standard]>=0.27.0
 pydantic>=2.5.0
+httpx>=0.27.0
+pydantic-settings>=2.2.1
+
+# Async application infrastructure
+SQLAlchemy[asyncio]>=2.0.36
+asyncpg>=0.30.0
+redis[hiredis]>=5.2.0
+arq>=0.26.1
+alembic>=1.14.0

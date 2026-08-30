@@ -12,7 +12,7 @@ function dedup(arr) {
 }
 
 // 代理池：独立管理的代理列表，localStorage 持久化。
-// 自动跑号时按 worker 顺序轮流取用（后端 /api/auto/start 的 proxy_pool 字段）。
+// 自动跑号时按 worker 顺序轮流取用（后端 worker 的 proxy_pool 配置）。
 export const useProxyStore = defineStore('proxy', () => {
   let saved = []
   try { saved = JSON.parse(localStorage.getItem(KEY) || '[]') } catch (_) { saved = [] }

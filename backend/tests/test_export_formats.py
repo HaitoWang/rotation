@@ -1,8 +1,5 @@
 import unittest
-from pathlib import Path
-from tempfile import TemporaryDirectory
-
-from app.webui import db, export_formats
+from app.services import export_formats
 
 
 class ExportFormatsTest(unittest.TestCase):
@@ -52,72 +49,6 @@ class ExportFormatsTest(unittest.TestCase):
             "person@outlook.com----gpt-password----mail-client----mail-refresh----"
             "gpt-web-at----gpt-codex-rt",
         )
-
-    def test_registered_export_rows_include_outlook_mail_credentials(self):
-        original_path = db.DB_PATH
-        try:
-            with TemporaryDirectory() as tmp:
-                db.DB_PATH = Path(tmp) / "webui.db"
-                db.init_db()
-                con = db._conn()
-                con.execute(
-                    "INSERT INTO outlook_accounts "
-                    "(email, password, client_id, refresh_token, status) "
-                    "VALUES (?, ?, ?, ?, 'done')",
-                    ("person@outlook.com", "mail-password", "mail-client", "mail-refresh"),
-                )
-                con.execute(
-                    "INSERT INTO registered "
-                    "(email, password, access_token, refresh_token, totp_secret, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, 1)",
-                    (
-                        "person@outlook.com",
-                        "gpt-password",
-                        "gpt-web-at",
-                        "gpt-codex-rt",
-                        "JBSWY3DPEHPK3PXP",
-                    ),
-                )
-                con.commit()
-                con.close()
-
-                row = db.list_registered_full()[0]
-                self.assertEqual(row["password"], "gpt-password")
-                self.assertEqual(row["mail_client_id"], "mail-client")
-                self.assertEqual(row["mail_refresh_token"], "mail-refresh")
-        finally:
-            db.DB_PATH = original_path
-
-    def test_registered_export_filter_and_soft_delete(self):
-        original_path = db.DB_PATH
-        try:
-            with TemporaryDirectory() as tmp:
-                db.DB_PATH = Path(tmp) / "webui.db"
-                db.init_db()
-                db.save_registered({
-                    "email": "has-rt@example.com",
-                    "access_token": "at",
-                    "refresh_token": "rt",
-                    "created_at": 2,
-                })
-                db.save_registered({
-                    "email": "no-rt@example.com",
-                    "access_token": "at",
-                    "refresh_token": "",
-                    "created_at": 1,
-                })
-
-                rows = db.list_registered_full(limit=100, filter_rt="has_rt")
-                self.assertEqual([row["email"] for row in rows], ["has-rt@example.com"])
-                self.assertEqual(db.soft_delete_registered_by_emails([rows[0]["email"]]), 1)
-                self.assertEqual(db.count_registered("has_rt"), 0)
-                self.assertIsNone(db.get_registered("has-rt@example.com"))
-                self.assertEqual(
-                    [row["email"] for row in db.list_registered_full(filter_rt="all")],
-                    ["no-rt@example.com"],
-                )
-        finally:
-            db.DB_PATH = original_path
 
 
 if __name__ == "__main__":

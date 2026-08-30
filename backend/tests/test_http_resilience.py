@@ -5,8 +5,8 @@ from types import SimpleNamespace
 from pathlib import Path
 from unittest import mock
 
-from app import http_client
-from app import sentinel_quickjs
+import app.integrations.openai.http_client as http_client
+import app.integrations.openai.sentinel_quickjs as sentinel_quickjs
 
 
 class HttpResilienceTests(unittest.TestCase):

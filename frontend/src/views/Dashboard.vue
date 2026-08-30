@@ -7,7 +7,8 @@ import { useRuntimeStore } from '@/stores/runtime'
 import StatusDot from '@/components/StatusDot.vue'
 
 const router = useRouter()
-const { stats } = storeToRefs(useStatsStore())
+const statsStore = useStatsStore()
+const { stats } = storeToRefs(statsStore)
 const { autoStatus } = storeToRefs(useRuntimeStore())
 
 const cards = computed(() => [
@@ -22,7 +23,7 @@ const actions = [
   { title: '邮箱列表', detail: '添加并管理接码邮箱账号', icon: 'Files', path: '/pool' },
   { title: '单次注册', detail: '指定一个账号立即执行', icon: 'VideoPlay', path: '/register' },
   { title: '全自动批量', detail: '配置并启动持续任务', icon: 'MagicStick', path: '/auto' },
-  { title: '查看注册结果', detail: '检查凭证并批量导出', icon: 'CircleCheck', path: '/registered' },
+  { title: '账号池', detail: '检查、重授权并批量导出凭证', icon: 'CircleCheck', path: '/registered' },
 ]
 
 const autoStateLabel = computed(() => ({
@@ -40,6 +41,16 @@ const targetProgress = computed(() => {
 
 <template>
   <div class="page dashboard-page">
+    <section class="workspace-heading">
+      <div>
+        <span class="workspace-eyebrow"><i />WORKSPACE OVERVIEW</span>
+        <h2>注册工作台</h2>
+        <p>账号资源、注册任务与接码状态</p>
+      </div>
+      <el-button class="heading-refresh" text circle aria-label="刷新数据" @click="statsStore.refresh">
+        <el-icon :size="16"><Refresh /></el-icon>
+      </el-button>
+    </section>
     <section class="stat-grid" aria-label="账号统计">
       <article v-for="card in cards" :key="card.label" class="metric-card" :class="`tone-${card.tone}`">
         <div class="metric-icon"><el-icon :size="18"><component :is="card.icon" /></el-icon></div>
@@ -109,31 +120,48 @@ const targetProgress = computed(() => {
 </template>
 
 <style scoped>
-.dashboard-page { display: flex; flex-direction: column; gap: 16px; }
-.stat-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 12px; }
+.dashboard-page { display: flex; flex-direction: column; gap: 12px; }
+.workspace-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 18px; padding: 8px 2px 3px; }
+.workspace-eyebrow { display: inline-flex; align-items: center; gap: 6px; color: #8b8b8b; font-size: 9px; font-weight: 650; letter-spacing: .08em; }
+.workspace-eyebrow i { width: 6px; height: 6px; border-radius: 50%; background: #2e8064; }
+.workspace-heading h2 { margin: 6px 0 0; color: var(--app-title); font-size: 25px; font-weight: 650; letter-spacing: -.025em; }
+.workspace-heading p { margin: 5px 0 0; color: var(--app-sidebar-muted); font-size: 12px; }
+.heading-refresh { color: var(--app-sidebar-muted); }
+.heading-refresh:hover { color: var(--app-title); background: var(--app-hover-bg); }
+.stat-grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 0;
+  overflow: hidden;
+  border: 1px solid var(--app-border);
+  border-radius: 8px;
+  background: var(--app-elevated-bg);
+}
 .metric-card {
   min-width: 0;
-  min-height: 110px;
+  min-height: 98px;
   display: flex;
   align-items: center;
   gap: 14px;
-  padding: 18px;
-  border: 1px solid var(--app-border);
-  border-radius: 10px;
+  padding: 15px 17px;
+  border: 0;
+  border-right: 1px solid var(--app-border);
+  border-radius: 0;
   background: var(--app-elevated-bg);
-  box-shadow: var(--app-shadow);
+  box-shadow: none;
 }
-.metric-icon { width: 38px; height: 38px; display: grid; place-items: center; flex: 0 0 auto; border-radius: 9px; }
+.metric-card:last-child { border-right: 0; }
+.metric-icon { width: 29px; height: 29px; display: grid; place-items: center; flex: 0 0 auto; border-radius: 5px; }
 .metric-content { min-width: 0; display: flex; flex-direction: column; }
-.metric-content strong { color: var(--app-title); font-size: 26px; font-weight: 680; line-height: 1; font-variant-numeric: tabular-nums; }
-.metric-content span { margin-top: 8px; color: var(--el-text-color-secondary); font-size: 11px; }
-.tone-blue .metric-icon { color: #0878f9; background: #eaf4ff; }
-.tone-green .metric-icon { color: #269246; background: #e9f7ed; }
-.tone-orange .metric-icon { color: #c77800; background: #fff3df; }
-.tone-cyan .metric-icon { color: #087f9b; background: #e6f6f8; }
-.tone-red .metric-icon { color: #d73a3a; background: #ffeded; }
-:global(html.dark) .metric-icon { background: color-mix(in srgb, currentColor 14%, transparent); }
-.dashboard-grid { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(340px, .8fr); gap: 16px; }
+.metric-content strong { color: var(--app-title); font-size: 24px; font-weight: 650; line-height: 1; font-variant-numeric: tabular-nums; }
+.metric-content span { margin-top: 7px; color: var(--app-sidebar-muted); font-size: 10px; }
+.tone-blue .metric-icon { color: #5270bf; background: var(--app-icon-bg); }
+.tone-green .metric-icon { color: #3d8a77; background: var(--app-icon-bg); }
+.tone-orange .metric-icon { color: #ae7b35; background: var(--app-icon-bg); }
+.tone-cyan .metric-icon { color: #4c8596; background: var(--app-icon-bg); }
+.tone-red .metric-icon { color: #b4645f; background: var(--app-icon-bg); }
+:global(html.dark) .metric-icon { background: var(--app-icon-bg); }
+.dashboard-grid { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(320px, .8fr); gap: 12px; }
 .dashboard-grid .el-card { margin: 0; }
 .runtime-summary { display: grid; grid-template-columns: minmax(160px, .75fr) 1.5fr; gap: 18px; align-items: stretch; }
 .runtime-primary { padding: 16px; border-radius: 9px; background: var(--el-fill-color-lighter); }
@@ -160,9 +188,12 @@ const targetProgress = computed(() => {
 @media (max-width: 1180px) { .stat-grid { grid-template-columns: repeat(3, 1fr); } }
 @media (max-width: 900px) { .dashboard-grid { grid-template-columns: 1fr; } }
 @media (max-width: 640px) {
+  .workspace-heading { align-items: flex-start; }
+  .workspace-heading h2 { font-size: 22px; }
+  .workspace-heading p { font-size: 11px; }
   .stat-grid { grid-template-columns: repeat(2, 1fr); gap: 10px; }
-  .metric-card { min-height: 92px; padding: 14px; }
-  .metric-icon { width: 34px; height: 34px; }
+  .metric-card { min-height: 88px; padding: 13px 12px; gap: 10px; }
+  .metric-icon { width: 27px; height: 27px; }
   .metric-content strong { font-size: 22px; }
   .runtime-summary { grid-template-columns: 1fr; }
   .runtime-stats div { padding-inline: 10px; }

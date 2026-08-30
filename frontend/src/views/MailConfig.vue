@@ -2,7 +2,7 @@
 // 邮箱来源配置。
 //
 // 这个页面不认识任何具体邮箱 —— 单选项和下面的表单字段全部来自
-// GET /api/mail/providers 的声明（provider 类里的 config_fields）。
+// GET /api/v1/settings/mail/providers 的声明（provider 类里的 config_fields）。
 // 后端加一种邮箱，这个文件一行都不用改。
 import { computed, onActivated, ref } from 'vue'
 import { ElMessage } from 'element-plus'

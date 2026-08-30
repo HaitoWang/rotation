@@ -37,7 +37,7 @@ export const useRuntimeStore = defineStore('runtime', () => {
   function streamRun(runId) {
     if (currentEs) { try { currentEs.close() } catch (_) {} }
     runningSingle.value = true
-    const es = createSSE(`/api/runs/${runId}/stream`, {
+    const es = createSSE(`/api/v1/runs/${runId}/events`, {
       log: (e) => {
         try {
           const d = JSON.parse(e.data)
@@ -85,7 +85,7 @@ export const useRuntimeStore = defineStore('runtime', () => {
   // ─── 自动跑号全局 SSE（app 启动时连一次，自动重连） ───
   function connectAutoStream() {
     if (autoEs) { try { autoEs.close() } catch (_) {} }
-    const es = createSSE('/api/auto/stream', {
+    const es = createSSE('/api/v1/auto/events', {
       state: (e) => {
         try { autoStatus.value = JSON.parse(e.data) } catch (_) {}
       },
@@ -93,14 +93,27 @@ export const useRuntimeStore = defineStore('runtime', () => {
         try {
           const d = JSON.parse(e.data)
           addLog(`[auto] 开始注册 ${d.email} (run=${d.run_id})`, 'evt')
-          streamRun(d.run_id) // 复用单跑 SSE，接管日志
+        } catch (_) {}
+      },
+      run_log: (e) => {
+        try {
+          const d = JSON.parse(e.data)
+          if (d.line) addLog(`[${d.email}][${d.run_id}] ${d.line}`)
+        } catch (_) {}
+      },
+      run_phase: (e) => {
+        try {
+          const d = JSON.parse(e.data)
+          const detail = d.message ? ` ${d.message}` : ''
+          addLog(`phase=${d.phase} email=${d.email}${detail}`, 'evt')
         } catch (_) {}
       },
       run_finished: (e) => {
         try {
           const d = JSON.parse(e.data)
           const tag = d.ok ? '[成功]' : (d.category === 'network' ? '[网络错误，正在换代理重试]' : '[失败]')
-          addLog(`[auto] ${tag} ${d.email} 完成`, d.ok ? 'ok' : 'err')
+          const detail = !d.ok && d.error ? `: ${d.error}` : ''
+          addLog(`[auto] ${tag} ${d.email} 完成 (run=${d.run_id})${detail}`, d.ok ? 'ok' : 'err')
           useStatsStore().refresh()
           bumpData()
         } catch (_) {}

@@ -1,7 +1,7 @@
 import unittest
 
-from app.mail_providers import create_mail_provider, list_pooled_providers, parse_import_text
-from app.mail_providers.mailbox_url import MailboxURLProvider
+from app.integrations.mail.providers import create_mail_provider, list_pooled_providers, parse_import_text
+from app.integrations.mail.providers.mailbox_url import MailboxURLProvider
 
 
 class _Response:
@@ -153,6 +153,33 @@ class MailboxURLProviderTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(Exception, "接码地址域名必须是"):
             provider.create_mailbox()
+
+    def test_assurivo_html_srcdoc_code_is_confirmed_even_when_page_markup_changes(self):
+        clock = _Clock()
+        html_one = (
+            '<html><body><div class="mail"><span>时间：2026-08-29 23:09:56</span>'
+            '<iframe srcdoc="&lt;p&gt;Enter this temporary verification code&lt;/p&gt;'
+            '&lt;p&gt;654321&lt;/p&gt;"></iframe></div></body></html>'
+        )
+        html_two = html_one.replace('class="mail"', 'class="mail refreshed"')
+        session = _Session([
+            _Response("<html><body>empty</body></html>"),
+            _Response(html_one),
+            _Response(html_two),
+        ])
+        provider = MailboxURLProvider(
+            "user@example.com",
+            "https://assurivo.com/console/open.php?mail=user%40example.com&pwd=SECRET&limit=1",
+            timeout=10,
+            poll_interval=0.1,
+            session=session,
+            clock=clock.monotonic,
+            wall_clock=clock.wall,
+            sleeper=clock.sleep,
+        )
+
+        provider.create_mailbox()
+        self.assertEqual(provider.wait_for_otp("user@example.com", timeout=10), "654321")
 
 
 if __name__ == "__main__":

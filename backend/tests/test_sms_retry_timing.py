@@ -6,7 +6,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from app.sms_provider import _earliest_retry_after
+from app.integrations.sms.provider import _earliest_retry_after
 
 
 class SmsRetryTimingTests(unittest.TestCase):
